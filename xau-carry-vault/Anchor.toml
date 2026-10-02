@@ -1,0 +1,20 @@
+skip_local_validator = true
+
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+basket-weighted-vault = "9zhhveFur9Kx6MCxYLLL4JiGAGWhY2bsjL9agcYY3BE2"
+xau_carry_vault = "7UjnUp67WKZXAF3gRV4pZgaD6qsWE13gCu116VXsA5cb"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test"
+
+[hooks]
