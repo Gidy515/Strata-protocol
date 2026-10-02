@@ -49,7 +49,8 @@ The workspace was created with `anchor init xau-carry-vault`, then `anchor new b
 ## Team ownership
 
 - Gideon: Vault 1 initialization, USDC deposits, and vXAU receipt issuance.
-- Teammates: Vault 2 initialization, basket deposits, and permissionless rebalancing.
+- Viraz: Vault 2 initialization, basket deposits, and permissionless rebalancing.
+- Ankit: Rebalancing 
 - Shared review: the vXAU mint, decimals, token program, POC valuation, and cross-program integration tests.
 
 ## Local development
