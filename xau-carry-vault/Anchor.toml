@@ -8,7 +8,7 @@ skip-lint = false
 
 [programs.localnet]
 basket-weighted-vault = "9zhhveFur9Kx6MCxYLLL4JiGAGWhY2bsjL9agcYY3BE2"
-xau_carry_vault = "7UjnUp67WKZXAF3gRV4pZgaD6qsWE13gCu116VXsA5cb"
+xau_carry_vault = "7mMR3QNnykdLvzVgys81aBL6hPNF96ZpmfxPSpf4EGgg"
 
 [provider]
 cluster = "localnet"
