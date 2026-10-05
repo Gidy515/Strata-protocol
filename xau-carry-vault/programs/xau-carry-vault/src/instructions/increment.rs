@@ -9,18 +9,4 @@ pub struct Increment<'info> {
     pub authority: Signer<'info>,
 }
 
-pub fn handle_increment(ctx: Context<Increment>) -> Result<()> {
-    require_keys_eq!(
-        ctx.accounts.counter.authority,
-        ctx.accounts.authority.key(),
-        ErrorCode::Unauthorized,
-    );
-    require!(
-        ctx.accounts.counter.count < MAX_COUNT,
-        ErrorCode::CounterOverflow,
-    );
 
-    ctx.accounts.counter.count += 1;
-    msg!("Hello, world! Counter is now {}", ctx.accounts.counter.count);
-    Ok(())
-}
