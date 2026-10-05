@@ -2,7 +2,7 @@ use {
     anchor_lang::{
         prelude::Pubkey,
         solana_program::system_program,
-        AccountDeserialize, InstructionData, ToAccountMetas,
+        AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas,
     },
     anchor_spl::{
         associated_token::get_associated_token_address,
@@ -564,5 +564,318 @@ fn failed_receipt_mint_rolls_back_usdc_transfer() {
     assert_eq!(
         fixture.mint(fixture.vxau_mint).supply,
         u64::MAX,
+    );
+}
+
+#[test]
+fn deposit_rejects_substituted_custody_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_custody = fixture.vault_usdc;
+    let substituted_custody = Keypair::new().pubkey();
+
+    // Valid SPL account with the correct mint and authority,
+    // but the wrong address. This isolates the PDA seed check.
+    let custody_account = fixture
+        .svm
+        .get_account(&legitimate_custody)
+        .unwrap();
+
+    fixture
+        .svm
+        .set_account(substituted_custody, custody_account)
+        .unwrap();
+
+    fixture.vault_usdc = substituted_custody;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintSeeds"),
+        "Expected custody PDA rejection; received: {error}",
+    );
+
+    fixture.vault_usdc = legitimate_custody;
+
+    fixture.assert_no_deposit();
+    assert_eq!(
+        fixture.token(substituted_custody).amount,
+        0,
+    );
+    assert_eq!(
+        fixture.mint(fixture.vxau_mint).supply,
+        0,
+    );
+}
+
+#[test]
+fn deposit_rejects_unrelated_receipt_mint() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_mint = fixture.vxau_mint;
+    let legitimate_receipt_ata = fixture.user_vxau;
+    let substituted_mint = Keypair::new().pubkey();
+
+    // Correct decimals and authority, but not the mint
+    // recorded in VaultV1State.
+    let mint_account = fixture
+        .svm
+        .get_account(&legitimate_mint)
+        .unwrap();
+
+    fixture
+        .svm
+        .set_account(substituted_mint, mint_account)
+        .unwrap();
+
+    let substituted_receipt_ata =
+        get_associated_token_address(
+            &fixture.user.pubkey(),
+            &substituted_mint,
+        );
+
+    fixture.vxau_mint = substituted_mint;
+    fixture.user_vxau = substituted_receipt_ata;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintHasOne")
+            || error.contains("ConstraintSeeds"),
+        "Expected receipt mint relationship rejection; received: {error}",
+    );
+
+    fixture.vxau_mint = legitimate_mint;
+    fixture.user_vxau = legitimate_receipt_ata;
+
+    fixture.assert_no_deposit();
+
+    assert_eq!(fixture.mint(legitimate_mint).supply, 0);
+    assert_eq!(fixture.mint(substituted_mint).supply, 0);
+
+    assert!(
+        fixture
+            .svm
+            .get_account(&substituted_receipt_ata)
+            .map_or(true, |account| account.lamports == 0)
+    );
+}
+
+#[test]
+fn deposit_rejects_another_users_source_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_source = fixture.user_usdc;
+    let other_user = Keypair::new();
+
+    let other_source = get_associated_token_address(
+        &other_user.pubkey(),
+        &fixture.usdc_mint,
+    );
+
+    let mut source_account = fixture
+        .svm
+        .get_account(&legitimate_source)
+        .unwrap();
+
+    let mut source =
+        SplTokenAccount::unpack(&source_account.data).unwrap();
+
+    source.owner = other_user.pubkey();
+
+    SplTokenAccount::pack(source, &mut source_account.data)
+        .unwrap();
+
+    fixture
+        .svm
+        .set_account(other_source, source_account)
+        .unwrap();
+
+    fixture.user_usdc = other_source;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintTokenOwner")
+            || error.contains("ConstraintAssociated"),
+        "Expected source ownership/ATA rejection; received: {error}",
+    );
+
+    fixture.user_usdc = legitimate_source;
+
+    fixture.assert_no_deposit();
+
+    assert_eq!(
+        fixture.token(other_source).amount,
+        INITIAL_USDC,
+    );
+    assert_eq!(
+        fixture.mint(fixture.vxau_mint).supply,
+        0,
+    );
+}
+
+#[test]
+fn deposit_rejects_cumulative_accounting_overflow() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    // Inject an extreme accounting value to exercise checked_add.
+    let mut state = fixture.state();
+    state.total_deposited = u64::MAX;
+
+    let mut state_account = fixture
+        .svm
+        .get_account(&fixture.vault_state)
+        .unwrap();
+
+    {
+        let mut destination: &mut [u8] =
+            state_account.data.as_mut_slice();
+
+        state.try_serialize(&mut destination).unwrap();
+    }
+
+    fixture
+        .svm
+        .set_account(fixture.vault_state, state_account)
+        .unwrap();
+
+    let error = fixture.deposit(1).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6003)"),
+        "Expected Overflow; received: {error}",
+    );
+
+    assert_eq!(
+        fixture.state().total_deposited,
+        u64::MAX,
+    );
+    assert_eq!(
+        fixture.token(fixture.user_usdc).amount,
+        INITIAL_USDC,
+    );
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 0);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+
+    assert!(
+        fixture
+            .svm
+            .get_account(&fixture.user_vxau)
+            .map_or(true, |account| account.lamports == 0)
+    );
+}
+
+#[test]
+fn multiple_users_receive_correct_receipts() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let first_source = fixture.user_usdc;
+    let first_receipt = fixture.user_vxau;
+
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let second_user = Keypair::new();
+
+    fixture
+        .svm
+        .airdrop(&second_user.pubkey(), 10_000_000_000)
+        .unwrap();
+
+    let second_source = get_associated_token_address(
+        &second_user.pubkey(),
+        &fixture.usdc_mint,
+    );
+
+    let second_receipt = get_associated_token_address(
+        &second_user.pubkey(),
+        &fixture.vxau_mint,
+    );
+
+    // Fund the second user's mock USDC account.
+    let mut source_account =
+        fixture.svm.get_account(&first_source).unwrap();
+
+    let mut source =
+        SplTokenAccount::unpack(&source_account.data).unwrap();
+
+    source.owner = second_user.pubkey();
+    source.amount = INITIAL_USDC;
+
+    SplTokenAccount::pack(source, &mut source_account.data)
+        .unwrap();
+
+    fixture
+        .svm
+        .set_account(second_source, source_account)
+        .unwrap();
+
+    // Keep the mock USDC mint supply consistent with funding.
+    let mut mint_account = fixture
+        .svm
+        .get_account(&fixture.usdc_mint)
+        .unwrap();
+
+    let mut mint =
+        SplMint::unpack(&mint_account.data).unwrap();
+
+    mint.supply = mint
+        .supply
+        .checked_add(INITIAL_USDC)
+        .unwrap();
+
+    SplMint::pack(mint, &mut mint_account.data).unwrap();
+
+    fixture
+        .svm
+        .set_account(fixture.usdc_mint, mint_account)
+        .unwrap();
+
+    fixture.user = second_user;
+    fixture.user_usdc = second_source;
+    fixture.user_vxau = second_receipt;
+
+    let second_amount = DEPOSIT_AMOUNT * 2;
+
+    fixture.deposit(second_amount).unwrap();
+
+    let total = DEPOSIT_AMOUNT + second_amount;
+
+    assert_eq!(
+        fixture.token(first_source).amount,
+        INITIAL_USDC - DEPOSIT_AMOUNT,
+    );
+    assert_eq!(
+        fixture.token(second_source).amount,
+        INITIAL_USDC - second_amount,
+    );
+
+    assert_eq!(
+        fixture.token(first_receipt).amount,
+        DEPOSIT_AMOUNT,
+    );
+    assert_eq!(
+        fixture.token(second_receipt).amount,
+        second_amount,
+    );
+
+    assert_eq!(
+        fixture.token(second_receipt).owner,
+        fixture.user.pubkey(),
+    );
+
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, total);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, total);
+    assert_eq!(fixture.state().total_deposited, total);
+
+    assert_eq!(
+        fixture.token(first_receipt).amount
+            + fixture.token(second_receipt).amount,
+        fixture.mint(fixture.vxau_mint).supply,
     );
 }
