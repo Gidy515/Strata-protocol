@@ -1,6 +1,5 @@
-skip_local_validator = true
-
 [toolchain]
+anchor_version = "1.2.0"
 
 [features]
 resolution = true
@@ -8,7 +7,7 @@ skip-lint = false
 
 [programs.localnet]
 basket-weighted-vault = "9zhhveFur9Kx6MCxYLLL4JiGAGWhY2bsjL9agcYY3BE2"
-xau_carry_vault = "7mMR3QNnykdLvzVgys81aBL6hPNF96ZpmfxPSpf4EGgg"
+xau_carry_vault = "8FUda9RyAkR2KR6pyBb6h7AVciNQawFRgu5WHZUifTto"
 
 [provider]
 cluster = "localnet"

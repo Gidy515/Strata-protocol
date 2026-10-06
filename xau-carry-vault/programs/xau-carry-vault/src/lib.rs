@@ -9,7 +9,7 @@ pub use constants::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("7mMR3QNnykdLvzVgys81aBL6hPNF96ZpmfxPSpf4EGgg");
+declare_id!("8FUda9RyAkR2KR6pyBb6h7AVciNQawFRgu5WHZUifTto");
 
 #[program]
 pub mod xau_carry_vault {
