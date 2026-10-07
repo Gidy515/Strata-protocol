@@ -1,25 +1,26 @@
-pub mod constants;
-pub mod error;
-pub mod instructions;
-pub mod state;
-
 use anchor_lang::prelude::*;
 
-pub use constants::*;
+pub mod instructions;
 pub use instructions::*;
-pub use state::*;
 
-declare_id!("9zhhveFur9Kx6MCxYLLL4JiGAGWhY2bsjL9agcYY3BE2");
+declare_id!("2nRrgbBQBr4NB81JnZx7ytnoug71HhFQunY5JyYwyTFt");
 
 #[program]
 pub mod basket_weighted_vault {
     use super::*;
 
-    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
-        crate::instructions::initialize::handle_initialize(ctx)
+    pub fn initialize_basket_config(
+        ctx: Context<InitializeBasketConfig>,
+        token_mints: [Pubkey; 4],
+        weights: [u16; 4],
+    ) -> Result<()> {
+        initialize_basket_config_handler(ctx, token_mints, weights)
     }
 
-    pub fn increment(ctx: Context<Increment>) -> Result<()> {
-        crate::instructions::increment::handle_increment(ctx)
+    pub fn deposit_to_basket_v2(
+        ctx: Context<DepositToBasketV2>,
+        total_amount: u64,
+    ) -> Result<()> {
+        deposit_to_basket_v2_handler(ctx, total_amount)
     }
 }
