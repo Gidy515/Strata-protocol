@@ -8,7 +8,7 @@ use anchor_lang::prelude::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("8FUda9RyAkR2KR6pyBb6h7AVciNQawFRgu5WHZUifTto");
+declare_id!("G1FuDAbgPsVw95XnEjT68nqpswUtvxFBtxz4mdTJKsye");
 
 #[program]
 pub mod xau_carry_vault {
