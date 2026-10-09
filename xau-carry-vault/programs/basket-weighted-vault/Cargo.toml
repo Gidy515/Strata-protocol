@@ -1,26 +1,31 @@
 [package]
 name = "basket-weighted-vault"
 version = "0.1.0"
-description = "Strata basket vault scaffold"
-edition.workspace = true
-rust-version.workspace = true
+description = "Created with Anchor"
+edition = "2021"
 
 [lib]
-crate-type = ["cdylib", "lib"]
+crate-type = ["cdylib", "rlib"]
 name = "basket_weighted_vault"
 
 [features]
+custom-heap = []
+custom-panic = []
+anchor-debug = []
 default = []
 cpi = ["no-entrypoint"]
 no-entrypoint = []
+no-idl = []
 no-log-ix-name = []
-idl-build = ["anchor-lang/idl-build"]
-anchor-debug = []
-custom-heap = []
-custom-panic = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build", "xau-carry-vault/idl-build"]
 
 [dependencies]
-anchor-lang = "=1.1.2"
+anchor-lang = { version = "1.2.0", features = ["init-if-needed"] }
+anchor-spl = { version = "1.2.0" }
+uint = { version = "0.10", default-features = false }
+# Vault 1, used only for its program ID, vXAU seed and state type, so the
+# vXAU check can never drift from the real Vault 1 program.
+xau-carry-vault = { path = "../xau-carry-vault", features = ["cpi"] }
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

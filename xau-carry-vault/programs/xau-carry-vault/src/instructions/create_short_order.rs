@@ -186,7 +186,7 @@ pub struct CreateShortOrderV1<'info> {
         ],
         bump
     )]
-    pub pending_short_order: Account<'info, PendingShortOrderV1>,
+    pub pending_short_order: Box<Account<'info, PendingShortOrderV1>>,
 
     /// CHECK: Exact event-authority PDA is checked.
     #[account(

@@ -1,0 +1,8 @@
+[env]
+RUSTC_BOOTSTRAP = "1"
+
+[build]
+rustflags = ["--cfg", "proc_macro_span"]
+
+[target.'cfg(all())']
+rustflags = ["--cfg", "proc_macro_span"]

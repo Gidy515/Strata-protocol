@@ -13,7 +13,7 @@ use anchor_lang::prelude::*;
 pub use instructions::*;
 pub use state::*;
 
-declare_id!("7UjnUp67WKZXAF3gRV4pZgaD6qsWE13gCu116VXsA5cb");
+declare_id!("G1FuDAbgPsVw95XnEjT68nqpswUtvxFBtxz4mdTJKsye");
 
 #[program]
 pub mod xau_carry_vault {
