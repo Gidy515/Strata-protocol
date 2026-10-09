@@ -4449,9 +4449,12 @@ version = "0.1.0"
 dependencies = [
  "anchor-lang",
  "anchor-spl",
+ "base64 0.22.1",
  "litesvm",
+ "serde_json",
  "solana-account",
  "solana-keypair",
+ "solana-last-restart-slot",
  "solana-message",
  "solana-program-option",
  "solana-program-pack",

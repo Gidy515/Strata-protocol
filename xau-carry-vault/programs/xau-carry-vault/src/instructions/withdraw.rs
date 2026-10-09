@@ -1,18 +1,17 @@
 use anchor_lang::prelude::*;
 use anchor_spl::{
     associated_token::AssociatedToken,
-    token::{self, Mint, MintTo, Token, TokenAccount, TransferChecked},
+    token::{self, Burn, Mint, Token, TokenAccount, TransferChecked},
 };
 
 use crate::{constants::*, error::VaultError, state::VaultV1State};
 
 #[derive(Accounts)]
-pub struct DepositUsdcV1<'info> {
+pub struct WithdrawUsdcV1<'info> {
     #[account(mut)]
     pub user: Signer<'info>,
 
     #[account(
-        mut,
         seeds = [
             VAULT_SEED,
             usdc_mint.key().as_ref()
@@ -55,18 +54,18 @@ pub struct DepositUsdcV1<'info> {
 
     #[account(
         mut,
-        associated_token::mint = usdc_mint,
-        associated_token::authority = user
-    )]
-    pub user_usdc_ata: Box<Account<'info, TokenAccount>>,
-
-    #[account(
-        init_if_needed,
-        payer = user,
         associated_token::mint = vxau_mint,
         associated_token::authority = user
     )]
     pub user_vxau_ata: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = user
+    )]
+    pub user_usdc_ata: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Canonical strategy PDA is constrained.
     /// The handler requires strategy configuration to be absent.
@@ -84,49 +83,57 @@ pub struct DepositUsdcV1<'info> {
     pub system_program: Program<'info, System>,
 }
 
-pub fn handle_deposit(ctx: Context<DepositUsdcV1>, amount: u64, min_shares_out: u64) -> Result<()> {
+pub fn handle_withdraw(
+    ctx: Context<WithdrawUsdcV1>,
+    amount: u64,
+    min_assets_out: u64,
+) -> Result<()> {
     require!(
-        !ctx.accounts.vault_v1_state.deposits_paused,
-        VaultError::DepositsPaused
+        !ctx.accounts.vault_v1_state.withdrawals_paused,
+        VaultError::WithdrawalsPaused
     );
+    // amount is the number of vXAU base units to burn.
     require!(amount > 0, VaultError::ZeroAmount);
-    require!(min_shares_out > 0, VaultError::InvalidMinimumOutput);
+    require!(min_assets_out > 0, VaultError::InvalidMinimumOutput);
 
     crate::instructions::read_idle_nav::require_idle_strategy(
         &ctx.accounts.strategy_account.to_account_info(),
     )?;
 
-    let next_total = ctx
-        .accounts
-        .vault_v1_state
-        .total_deposited
-        .checked_add(amount)
-        .ok_or(VaultError::Overflow)?;
+    require!(
+        ctx.accounts.user_vxau_ata.amount >= amount,
+        VaultError::InsufficientReceipts
+    );
 
-    // Read NAV and outstanding supply BEFORE the deposit.
-    let shares_out = crate::share_math::shares_for_deposit(
+    let assets_out = crate::share_math::assets_for_redemption(
         amount,
         ctx.accounts.vxau_mint.supply,
         ctx.accounts.vault_v1_usdc_account.amount,
     )?;
 
+    // Never burn shares for an output rounded down to zero.
+    require!(assets_out > 0, VaultError::RedemptionTooSmall);
+
     require!(
-        shares_out >= min_shares_out,
+        assets_out >= min_assets_out,
         VaultError::MinimumOutputNotMet
     );
 
-    token::transfer_checked(
+    require!(
+        ctx.accounts.vault_v1_usdc_account.amount >= assets_out,
+        VaultError::InsufficientLiquidity
+    );
+
+    token::burn(
         CpiContext::new(
             ctx.accounts.token_program.key(),
-            TransferChecked {
-                from: ctx.accounts.user_usdc_ata.to_account_info(),
-                mint: ctx.accounts.usdc_mint.to_account_info(),
-                to: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+            Burn {
+                mint: ctx.accounts.vxau_mint.to_account_info(),
+                from: ctx.accounts.user_vxau_ata.to_account_info(),
                 authority: ctx.accounts.user.to_account_info(),
             },
         ),
         amount,
-        RECEIPT_DECIMALS,
     )?;
 
     let usdc_mint_key = ctx.accounts.usdc_mint.key();
@@ -134,20 +141,21 @@ pub fn handle_deposit(ctx: Context<DepositUsdcV1>, amount: u64, min_shares_out: 
 
     let vault_seeds: &[&[u8]] = &[VAULT_SEED, usdc_mint_key.as_ref(), &bump];
 
-    token::mint_to(
+    token::transfer_checked(
         CpiContext::new_with_signer(
             ctx.accounts.token_program.key(),
-            MintTo {
-                mint: ctx.accounts.vxau_mint.to_account_info(),
-                to: ctx.accounts.user_vxau_ata.to_account_info(),
+            TransferChecked {
+                from: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
+                to: ctx.accounts.user_usdc_ata.to_account_info(),
                 authority: ctx.accounts.vault_v1_state.to_account_info(),
             },
             &[vault_seeds],
         ),
-        shares_out,
+        assets_out,
+        RECEIPT_DECIMALS,
     )?;
 
-    ctx.accounts.vault_v1_state.total_deposited = next_total;
-
+    // Historical cumulative deposits remain unchanged.
     Ok(())
 }
