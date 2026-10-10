@@ -20,9 +20,9 @@ pub struct UsdPrice {
 
 /// Validated confidence bounds in six-decimal USD units.
 #[derive(Clone, Copy, Debug)]
-struct UsdBounds {
-    lower: u128,
-    upper: u128,
+pub(crate) struct UsdBounds {
+    pub(crate) lower: u128,
+    pub(crate) upper: u128,
 }
 
 fn checked_pow10(exponent: u32) -> Result<u128> {
@@ -35,7 +35,7 @@ fn checked_pow10(exponent: u32) -> Result<u128> {
 ///
 /// Confidence is checked in native units so rounding cannot hide
 /// an excessively uncertain price.
-fn validated_bounds(
+pub(crate) fn validated_bounds(
     observation: &UsdPrice,
     now: i64,
     max_age_seconds: u64,

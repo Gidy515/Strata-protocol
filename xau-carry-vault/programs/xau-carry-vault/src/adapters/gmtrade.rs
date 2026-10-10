@@ -379,3 +379,68 @@ pub fn close_short_order_instruction(
         data,
     })
 }
+
+/// Native USD minimum is a value (20 decimals), not a token quantity.
+pub struct ShortDecreaseParams {
+    pub collateral_withdrawal: u64,
+    pub size_delta_value: u128,
+    pub acceptable_price: u128,
+    pub min_output_value: u128,
+    pub execution_lamports: u64,
+}
+pub fn create_short_decrease_instruction(
+    a: &ShortOrderAccounts,
+    nonce: &[u8; 32],
+    p: &ShortDecreaseParams,
+) -> Result<Instruction> {
+    validate_addresses(a, nonce)?;
+    require!(
+        p.size_delta_value > 0 && p.acceptable_price > 0,
+        VaultError::InvalidShortOrderParameters
+    );
+    let mut ix = create_short_order_instruction(
+        a,
+        nonce,
+        &ShortIncreaseParams {
+            collateral_amount: 1,
+            size_delta_value: p.size_delta_value,
+            acceptable_price: p.acceptable_price,
+            execution_lamports: p.execution_lamports,
+        },
+    )?;
+    let absent = AccountMeta::new_readonly(a.perpetual_program, false);
+    ix.accounts[7] = absent.clone();
+    ix.accounts[11] = absent.clone();
+    ix.accounts[12] = AccountMeta::new(a.order_usdc_escrow, false);
+    ix.accounts[15] = absent;
+    let mut data = CREATE_ORDER_V2_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(nonce);
+    data.push(4); // MarketDecrease
+    data.push(0); // no decrease swap: both collateral and payout are USDC
+    data.extend_from_slice(&p.execution_lamports.to_le_bytes());
+    data.push(0); // no swap path
+    data.extend_from_slice(&p.collateral_withdrawal.to_le_bytes());
+    data.extend_from_slice(&p.size_delta_value.to_le_bytes());
+    data.extend_from_slice(&[0, 0, 1]); // short, short collateral, Some min-output value
+    data.extend_from_slice(&p.min_output_value.to_le_bytes());
+    data.push(0); // no trigger
+    data.push(1);
+    data.extend_from_slice(&p.acceptable_price.to_le_bytes());
+    data.extend_from_slice(&[0, 0, 0]); // no unwrap, valid-from or callback
+    ix.data = data;
+    Ok(ix)
+}
+pub fn close_short_decrease_instruction(
+    a: &ShortOrderAccounts,
+    nonce: &[u8; 32],
+) -> Result<Instruction> {
+    let mut ix = close_short_order_instruction(a, nonce)?;
+    let absent = AccountMeta::new_readonly(a.perpetual_program, false);
+    ix.accounts[9] = absent.clone();
+    ix.accounts[10] = AccountMeta::new_readonly(a.usdc_mint, false);
+    ix.accounts[13] = absent.clone();
+    ix.accounts[14] = AccountMeta::new(a.order_usdc_escrow, false);
+    ix.accounts[17] = absent;
+    ix.accounts[18] = AccountMeta::new(a.strategy_usdc_source, false);
+    Ok(ix)
+}

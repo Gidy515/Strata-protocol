@@ -89,3 +89,18 @@ pub fn require_idle_strategy(strategy_info: &AccountInfo<'_>) -> Result<()> {
 
     Ok(())
 }
+
+
+
+#[derive(AnchorSerialize,AnchorDeserialize,Clone,Debug)]
+pub struct FullNavQuoteV1 {
+ pub net_assets:u64, pub share_supply:u64, pub available_usdc:u64,
+ pub gold_value_usdc:u64, pub perpetual_equity_usdc:i128, pub observed_slot:u64,
+}
+pub fn handle_read_full_nav(ctx:Context<ReadIdleNavV1>)->Result<FullNavQuoteV1>{
+ let q=crate::strategy_nav::quote(ctx.accounts.vault_v1_state.key(),&ctx.accounts.vault_v1_state,
+  &ctx.accounts.strategy_account.to_account_info(),ctx.accounts.vault_v1_usdc_account.amount,ctx.remaining_accounts)?;
+ Ok(FullNavQuoteV1{net_assets:q.net_assets,share_supply:ctx.accounts.vxau_mint.supply,
+  available_usdc:q.available_usdc,gold_value_usdc:q.gold_value_usdc,
+  perpetual_equity_usdc:q.perpetual_equity_usdc,observed_slot:q.observed_slot})
+}

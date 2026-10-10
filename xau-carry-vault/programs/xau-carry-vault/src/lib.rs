@@ -7,6 +7,8 @@ pub mod oracle_math;
 pub mod pyth_reader;
 pub mod share_math;
 pub mod state;
+pub mod strategy_accounting;
+pub mod strategy_nav;
 
 use anchor_lang::prelude::*;
 
@@ -65,8 +67,53 @@ pub mod xau_carry_vault {
         instructions::create_short_order::handle_create_short_order(ctx, nonce, params)
     }
 
+    pub fn buy_gold_v1<'info>(
+        ctx: Context<'info, GoldTradeV1<'info>>,
+        params: GoldTradeParamsV1,
+    ) -> Result<()> {
+        instructions::gold_trade::handle_gold_trade(ctx, params, true)
+    }
+    pub fn sell_gold_v1<'info>(
+        ctx: Context<'info, GoldTradeV1<'info>>,
+        params: GoldTradeParamsV1,
+    ) -> Result<()> {
+        instructions::gold_trade::handle_gold_trade(ctx, params, false)
+    }
+    pub fn create_short_decrease_v1(
+        ctx: Context<CreateShortDecreaseV1>,
+        nonce: [u8; 32],
+        params: ShortDecreaseParamsV1,
+    ) -> Result<()> {
+        instructions::short_decrease::handle_create_decrease(ctx, nonce, params)
+    }
+    pub fn reconcile_short_decrease_v1(ctx: Context<RecoverShortDecreaseV1>) -> Result<()> {
+        instructions::recover_short_decrease::handle_recover_decrease(ctx, false)
+    }
+    pub fn cancel_short_decrease_v1(ctx: Context<RecoverShortDecreaseV1>) -> Result<()> {
+        instructions::recover_short_decrease::handle_recover_decrease(ctx, true)
+    }
+    pub fn accept_full_close_decrease_v1(ctx: Context<RecoverShortDecreaseV1>) -> Result<()> {
+        instructions::recover_short_decrease::handle_accept_full_close(ctx)
+    }
+    pub fn sweep_strategy_usdc_v1(ctx: Context<SweepStrategyUsdcV1>) -> Result<()> {
+        instructions::gold_trade::handle_sweep(ctx)
+    }
+
     pub fn cancel_short_order_v1(ctx: Context<CancelShortOrderV1>) -> Result<()> {
         instructions::cancel_short_order::handle_cancel_short_order(ctx)
+    }
+
+    pub fn set_strategy_execution_v1(
+        ctx: Context<SetStrategyExecutionV1>,
+        enabled: bool,
+    ) -> Result<()> {
+        instructions::reconcile_short_order::handle_set_strategy_execution(ctx, enabled)
+    }
+    pub fn reconcile_short_order_v1(ctx: Context<ReconcileShortOrderV1>) -> Result<()> {
+        instructions::reconcile_short_order::handle_reconcile(ctx)
+    }
+    pub fn read_full_nav_v1(ctx: Context<ReadIdleNavV1>) -> Result<FullNavQuoteV1> {
+        instructions::read_idle_nav::handle_read_full_nav(ctx)
     }
 
     pub fn read_idle_nav_v1(ctx: Context<ReadIdleNavV1>) -> Result<IdleNavQuoteV1> {

@@ -63,3 +63,39 @@ pub struct WithdrawalRequestV1 {
     pub requested_at_slot: u64,
     pub bump: u8,
 }
+
+/// Separate extension PDA: existing Vault/Strategy/Pending layouts remain stable.
+#[account]
+#[derive(InitSpace)]
+pub struct OrderBaselineV1 {
+    pub vault: Pubkey,
+    pub order: Pubkey,
+    pub position: Pubkey,
+    pub nonce: [u8; 32],
+    pub refund: Pubkey,
+    pub submitted_slot: u64,
+    pub size_before: u128,
+    pub collateral_before: u128,
+    pub trade_id_before: u64,
+    pub expected_size_delta: u128,
+    pub bump: u8,
+}
+
+/// Decrease orders have a separate discriminator, preserving existing increase baselines.
+#[account]
+#[derive(InitSpace)]
+pub struct DecreaseBaselineV1 {
+    pub vault: Pubkey,
+    pub order: Pubkey,
+    pub position: Pubkey,
+    pub nonce: [u8; 32],
+    pub refund: Pubkey,
+    pub submitted_slot: u64,
+    pub size_before: u128,
+    pub collateral_before: u128,
+    pub trade_id_before: u64,
+    pub expected_size_delta: u128,
+    pub min_usdc_out: u64,
+    pub allow_full_close: bool,
+    pub bump: u8,
+}

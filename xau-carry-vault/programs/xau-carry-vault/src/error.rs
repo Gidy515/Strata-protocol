@@ -172,4 +172,20 @@ pub enum VaultError {
 
     #[msg("Unowned custody recovery requires zero outstanding shares")]
     OutstandingShares,
+    #[msg("Authenticated strategy accounting failed or unsupported GMTrade state")]
+    StrategyAccountingFailed,
+    #[msg("GMTrade order execution has not been proven")]
+    UnprovenOrderExecution,
+    #[msg("Order baseline does not match the current pending order")]
+    InvalidOrderBaseline,
+
+    #[msg("Final redemption requires the strategy to be fully unwound")]
+    StrategyUnwindRequired,
+
+    #[msg("Invalid or unsupported gold swap route")]
+    InvalidGoldRoute,
+    #[msg("Swap or hedge execution exceeds the trusted oracle bound")]
+    StrategyPriceBound,
+    #[msg("Strategy token authority, delegate or mint changed during CPI")]
+    StrategyAccountChanged,
 }

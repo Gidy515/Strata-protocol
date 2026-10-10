@@ -49,3 +49,9 @@ pub const GMTRADE_ORDER_DISCRIMINATOR: [u8; 8] = [134, 173, 223, 185, 77, 86, 28
 
 pub const WITHDRAWAL_REQUEST_SEED: &[u8] = b"withdrawal_request";
 pub const WITHDRAWAL_ESCROW_SEED: &[u8] = b"withdrawal_escrow";
+
+pub const ORDER_BASELINE_SEED: &[u8] = b"order_baseline_v1";
+
+pub const DECREASE_BASELINE_SEED: &[u8] = b"decrease_baseline_v1";
+pub const JUPITER_PROGRAM_ADDRESS: &str = "JUP6LkbZbjS1jKKwapdHNy74zcZ3tLUZoi5QNyVTaV4";
+pub const MAX_TRADE_DEVIATION_BPS: u64 = 100;

@@ -96,8 +96,15 @@ fn insert_state<T: AccountSerialize>(svm: &mut LiteSVM, address: Pubkey, state: 
 }
 
 fn send(svm: &mut LiteSVM, admin: &Keypair, instruction: Instruction) {
+    let mut budget_data = vec![2];
+    budget_data.extend_from_slice(&600_000u32.to_le_bytes());
+    let budget = Instruction {
+        program_id: key("ComputeBudget111111111111111111111111111111"),
+        accounts: vec![],
+        data: budget_data,
+    };
     let message = Message::new_with_blockhash(
-        &[instruction],
+        &[budget, instruction],
         Some(&admin.pubkey()),
         &svm.latest_blockhash(),
     );
@@ -417,8 +424,15 @@ fn token_amount(svm: &LiteSVM, address: Pubkey) -> u64 {
 }
 
 fn expect_failure(svm: &mut LiteSVM, admin: &Keypair, instruction: Instruction) -> String {
+    let mut budget_data = vec![2];
+    budget_data.extend_from_slice(&600_000u32.to_le_bytes());
+    let budget = Instruction {
+        program_id: key("ComputeBudget111111111111111111111111111111"),
+        accounts: vec![],
+        data: budget_data,
+    };
     let message = Message::new_with_blockhash(
-        &[instruction],
+        &[budget, instruction],
         Some(&admin.pubkey()),
         &svm.latest_blockhash(),
     );
@@ -507,6 +521,11 @@ fn exercise_order_creation(
             perpetual_order: order,
             order_usdc_escrow: escrow,
             pending_short_order: pending,
+            order_baseline: Pubkey::find_program_address(
+                &[ORDER_BASELINE_SEED, order.as_ref()],
+                &our_program,
+            )
+            .0,
             perpetual_event_authority: event_authority,
             token_program: spl_token::ID,
             associated_token_program: anchor_spl::associated_token::ID,
@@ -643,7 +662,7 @@ fn exercise_order_creation(
     let second_escrow =
         anchor_spl::associated_token::get_associated_token_address(&second_order, &usdc);
 
-    let mut second_instruction = instruction;
+    let mut second_instruction = instruction.clone();
 
     for account in &mut second_instruction.accounts {
         if account.pubkey == order {
@@ -653,6 +672,8 @@ fn exercise_order_creation(
         }
     }
 
+    second_instruction.accounts[15].pubkey =
+        Pubkey::find_program_address(&[ORDER_BASELINE_SEED, second_order.as_ref()], &our_program).0;
     second_instruction.data = xau_carry_vault::instruction::CreateShortOrderV1 {
         nonce: second_nonce,
         params: CreateShortOrderParamsV1 {
@@ -668,7 +689,7 @@ fn exercise_order_creation(
     let custody_before_second = token_amount(svm, custody);
     let authority_before_second = svm.get_account(&authority).unwrap().lamports;
 
-    let error = expect_failure(svm, admin, second_instruction);
+    let error = expect_failure(svm, admin, second_instruction.clone());
 
     assert!(
         error.contains("already in use"),
@@ -717,6 +738,10 @@ fn exercise_order_creation(
             vault_v1_state: vault,
             strategy_v1_state: strategy,
             pending_short_order: pending,
+            order_baseline: Some(
+                Pubkey::find_program_address(&[ORDER_BASELINE_SEED, order.as_ref()], &our_program)
+                    .0,
+            ),
             usdc_mint: usdc,
             vault_v1_usdc_account: custody,
             strategy_authority: authority,
@@ -767,5 +792,328 @@ fn exercise_order_creation(
 
     assert_eq!(svm.get_account(&position).unwrap().data, position_before,);
 
+    let baseline_address =
+        Pubkey::find_program_address(&[ORDER_BASELINE_SEED, order.as_ref()], &our_program).0;
+    assert_uncreated(svm, baseline_address);
     println!("Order cancellation returned collateral and cleared pending state");
+
+    // Submit again through the real captured GMTrade program, now starting from a
+    // nonzero position baseline. Execution outcome below is injected, not a live oracle trade.
+    let strategy_account = svm.get_account(&strategy).unwrap();
+    let mut state =
+        StrategyV1State::try_deserialize(&mut strategy_account.data.as_slice()).unwrap();
+    state.execution_enabled = true;
+    insert_state(svm, strategy, &state, strategy_account.data.len());
+    let mut before = svm.get_account(&position).unwrap();
+    let mut typed =
+        bytemuck::allocation::zeroed_box::<gmsol_programs::gmsol_store::accounts::Position>();
+    bytemuck::bytes_of_mut(&mut *typed).copy_from_slice(&before.data[8..]);
+    typed.state.size_in_usd = 50 * 10u128.pow(20);
+    typed.state.size_in_tokens = 1_000_000;
+    typed.state.collateral_amount = 10_000_000;
+    typed.state.trade_id = 8;
+    before.data[8..].copy_from_slice(bytemuck::bytes_of(&*typed));
+    svm.set_account(position, before).unwrap();
+    let second_baseline = second_instruction.accounts[15].pubkey;
+    // A donated lamport cannot block creation of the canonical baseline extension.
+    svm.airdrop(&second_baseline, 1).unwrap();
+    send(svm, admin, second_instruction.clone());
+    let saved = svm.get_account(&second_baseline).unwrap();
+    let baseline =
+        xau_carry_vault::state::OrderBaselineV1::try_deserialize(&mut saved.data.as_slice())
+            .unwrap();
+    assert_eq!(baseline.size_before, 50 * 10u128.pow(20));
+    assert_eq!(baseline.trade_id_before, 8);
+    assert_eq!(baseline.collateral_before, 10_000_000);
+    assert_eq!(baseline.order, second_order);
+    assert_eq!(baseline.nonce, second_nonce);
+    let reconciliation = Instruction {
+        program_id: our_program,
+        accounts: xau_carry_vault::accounts::ReconcileShortOrderV1 {
+            keeper: admin.pubkey(),
+            refund: admin.pubkey(),
+            vault_v1_state: vault,
+            strategy_v1_state: strategy,
+            pending_short_order: pending,
+            order_baseline: second_baseline,
+            usdc_mint: usdc,
+            vault_v1_usdc_account: custody,
+            strategy_authority: authority,
+            strategy_usdc_source: source,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_store_wallet: store_wallet,
+            perpetual_user: external_user,
+            perpetual_order: second_order,
+            order_usdc_escrow: second_escrow,
+            perpetual_event_authority: event_authority,
+            perpetual_market: market,
+            perpetual_position: position,
+            token_program: spl_token::ID,
+            associated_token_program: anchor_spl::associated_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: xau_carry_vault::instruction::ReconcileShortOrderV1 {}.data(),
+    };
+    // Pending order / empty escrow alone cannot establish execution.
+    let error = expect_failure(svm, admin, reconciliation.clone());
+    assert!(error.contains("UnprovenOrderExecution"), "{error}");
+    let mut completed = svm.get_account(&second_order).unwrap();
+    let mut decoded =
+        bytemuck::allocation::zeroed_box::<gmsol_programs::gmsol_store::accounts::Order>();
+    bytemuck::bytes_of_mut(&mut *decoded).copy_from_slice(&completed.data[8..]);
+    let mut clock = svm.get_sysvar::<anchor_lang::prelude::Clock>();
+    clock.slot = 100;
+    svm.set_sysvar(&clock);
+    decoded.header.action_state = 1;
+    decoded.header.updated_at_slot = 1;
+    completed.data[8..].copy_from_slice(bytemuck::bytes_of(&*decoded));
+    svm.set_account(second_order, completed).unwrap();
+    // Authentic completed order with unchanged trade state must still fail.
+    let error = expect_failure(svm, admin, reconciliation.clone());
+    assert!(error.contains("UnprovenOrderExecution"), "{error}");
+    let mut executed = svm.get_account(&position).unwrap();
+    typed.state.trade_id = 9;
+    typed.state.updated_at_slot = 1;
+    typed.state.size_in_usd = baseline.size_before + baseline.expected_size_delta;
+    typed.state.collateral_amount = 100_000_000;
+    executed.data[8..].copy_from_slice(bytemuck::bytes_of(&*typed));
+    svm.set_account(position, executed).unwrap();
+    // Model an execution that consumed collateral but left one USDC funding credit.
+    let mut escrow_account = svm.get_account(&second_escrow).unwrap();
+    let mut escrow_tokens = spl_token::state::Account::unpack(&escrow_account.data).unwrap();
+    escrow_tokens.amount = 1_000_000;
+    spl_token::state::Account::pack(escrow_tokens, &mut escrow_account.data).unwrap();
+    svm.set_account(second_escrow, escrow_account).unwrap();
+    let source_before = token_amount(svm, source);
+    let custody_before = token_amount(svm, custody);
+    let keeper = Keypair::new();
+    svm.airdrop(&keeper.pubkey(), 1_000_000_000).unwrap();
+    let mut permissionless_reconciliation = reconciliation.clone();
+    permissionless_reconciliation.accounts[0].pubkey = keeper.pubkey();
+    send(svm, &keeper, permissionless_reconciliation.clone());
+    assert_eq!(token_amount(svm, source), source_before + 1_000_000);
+    assert_eq!(token_amount(svm, custody), custody_before);
+    assert_uncreated(svm, pending);
+    assert_uncreated(svm, second_baseline);
+    assert_uncreated(svm, second_order);
+    assert_uncreated(svm, second_escrow);
+    expect_failure(svm, &keeper, permissionless_reconciliation); // Closed baseline/order cannot be replayed.
+    println!("Reconciliation checked persisted baseline and swept execution funding credit through real GMTrade close CPI");
+    // Decrease orders use the actual captured GMTrade create/set-keep/close CPIs.
+    // Execution results are still controlled fixtures, not oracle-backed fills.
+    let index_price = Pubkey::new_unique();
+    let usdc_price = Pubkey::new_unique();
+    let current_clock = svm.get_sysvar::<anchor_lang::prelude::Clock>();
+    for (oracle_key, feed, price) in [
+        (
+            index_price,
+            xau_carry_vault::strategy_nav::XAU_FEED,
+            3_000_000_000i64,
+        ),
+        (
+            usdc_price,
+            xau_carry_vault::strategy_nav::USDC_FEED,
+            1_000_000,
+        ),
+    ] {
+        let mut d = vec![0u8; 134];
+        d[..8].copy_from_slice(&[34, 241, 35, 99, 157, 126, 244, 205]);
+        d[40] = 1;
+        for i in 0..32 {
+            d[41 + i] = u8::from_str_radix(&feed[i * 2..i * 2 + 2], 16).unwrap();
+        }
+        d[73..81].copy_from_slice(&price.to_le_bytes());
+        d[89..93].copy_from_slice(&(-6i32).to_le_bytes());
+        d[93..101].copy_from_slice(&current_clock.unix_timestamp.to_le_bytes());
+        d[125..133].copy_from_slice(&current_clock.slot.to_le_bytes());
+        svm.set_account(
+            oracle_key,
+            Account {
+                lamports: 10_000_000,
+                data: d,
+                owner: key("rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp"),
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+    for (iteration, full, cancel) in [
+        (0u8, false, true),
+        (1, false, false),
+        (2, true, false),
+        (3, false, false),
+    ] {
+        let nonce = [60 + iteration; 32];
+        let (order, _) = order_address(&external_program, &store, &authority, &nonce);
+        let escrow = anchor_spl::associated_token::get_associated_token_address(&order, &usdc);
+        let baseline_address =
+            Pubkey::find_program_address(&[DECREASE_BASELINE_SEED, order.as_ref()], &our_program).0;
+        let position_before = svm.get_account(&position).unwrap();
+        let mut state =
+            bytemuck::allocation::zeroed_box::<gmsol_programs::gmsol_store::accounts::Position>();
+        bytemuck::bytes_of_mut(&mut *state).copy_from_slice(&position_before.data[8..]);
+        let forced = iteration == 3;
+        if forced {
+            state.state.size_in_usd = 100 * 10u128.pow(20);
+            state.state.size_in_tokens = 100_000;
+            state.state.collateral_amount = 10_000_000;
+            let mut reset = position_before.clone();
+            reset.data[8..].copy_from_slice(bytemuck::bytes_of(&*state));
+            svm.set_account(position, reset).unwrap();
+        }
+        let delta = if full {
+            state.state.size_in_usd
+        } else {
+            50 * 10u128.pow(20)
+        };
+        let mut create = Instruction {
+            program_id: our_program,
+            accounts: xau_carry_vault::accounts::CreateShortDecreaseV1 {
+                admin: admin.pubkey(),
+                vault_v1_state: vault,
+                strategy_v1_state: strategy,
+                usdc_mint: usdc,
+                vault_v1_usdc_account: custody,
+                strategy_authority: authority,
+                strategy_usdc_source: source,
+                perpetual_program: external_program,
+                perpetual_store: store,
+                perpetual_market: market,
+                perpetual_user: external_user,
+                perpetual_position: position,
+                perpetual_order: order,
+                order_usdc_escrow: escrow,
+                pending_short_order: pending,
+                order_baseline: baseline_address,
+                perpetual_event_authority: event_authority,
+                token_program: spl_token::ID,
+                associated_token_program: anchor_spl::associated_token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::CreateShortDecreaseV1 {
+                nonce,
+                params: xau_carry_vault::ShortDecreaseParamsV1 {
+                    collateral_withdrawal: if full { 0 } else { 10_000_000 },
+                    size_delta_value: delta,
+                    acceptable_price: 3_000_000_000_000_000,
+                    min_usdc_out: if full { 0 } else { 8_000_000 },
+                    allow_full_close: false,
+                    execution_lamports: 50_000_000,
+                    funding_lamports: 100_000_000,
+                },
+            }
+            .data(),
+        };
+        create.accounts.extend([
+            anchor_lang::solana_program::instruction::AccountMeta::new_readonly(index_price, false),
+            anchor_lang::solana_program::instruction::AccountMeta::new_readonly(usdc_price, false),
+        ]);
+        send(svm, admin, create);
+        let saved = svm.get_account(&baseline_address).unwrap();
+        let baseline =
+            xau_carry_vault::DecreaseBaselineV1::try_deserialize(&mut &saved.data[..]).unwrap();
+        assert_eq!(baseline.size_before, state.state.size_in_usd);
+        assert_eq!(baseline.trade_id_before, state.state.trade_id);
+        let custody_before = token_amount(svm, custody);
+        let source_before = token_amount(svm, source);
+        assert_eq!(token_amount(svm, escrow), 0);
+        let recover = Instruction {
+            program_id: our_program,
+            accounts: xau_carry_vault::accounts::RecoverShortDecreaseV1 {
+                keeper: keeper.pubkey(),
+                vault_v1_state: vault,
+                strategy_v1_state: strategy,
+                pending_short_order: pending,
+                order_baseline: baseline_address,
+                refund: admin.pubkey(),
+                usdc_mint: usdc,
+                vault_v1_usdc_account: custody,
+                strategy_authority: authority,
+                strategy_usdc_source: source,
+                perpetual_program: external_program,
+                perpetual_store: store,
+                perpetual_store_wallet: store_wallet,
+                perpetual_user: external_user,
+                perpetual_order: order,
+                order_usdc_escrow: escrow,
+                perpetual_event_authority: event_authority,
+                perpetual_market: market,
+                perpetual_position: position,
+                token_program: spl_token::ID,
+                associated_token_program: anchor_spl::associated_token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::ReconcileShortDecreaseV1 {}.data(),
+        };
+        if cancel {
+            let mut cancellation = recover.clone();
+            cancellation.data = xau_carry_vault::instruction::CancelShortDecreaseV1 {}.data();
+            assert!(expect_failure(svm, &keeper, cancellation.clone())
+                .contains("UnauthorizedStrategyAdmin"));
+            cancellation.accounts[0].pubkey = admin.pubkey();
+            send(svm, admin, cancellation);
+            assert_eq!(token_amount(svm, custody), custody_before + source_before);
+            assert_eq!(token_amount(svm, source), 0);
+            continue;
+        }
+        assert!(expect_failure(svm, &keeper, recover.clone()).contains("UnprovenOrderExecution"));
+        let mut completed = svm.get_account(&order).unwrap();
+        let mut order_state =
+            bytemuck::allocation::zeroed_box::<gmsol_programs::gmsol_store::accounts::Order>();
+        bytemuck::bytes_of_mut(&mut *order_state).copy_from_slice(&completed.data[8..]);
+        order_state.header.action_state = 1;
+        order_state.header.updated_at_slot = current_clock.slot;
+        completed.data[8..].copy_from_slice(bytemuck::bytes_of(&*order_state));
+        svm.set_account(order, completed).unwrap();
+        assert!(expect_failure(svm, &keeper, recover.clone()).contains("UnprovenOrderExecution"));
+        let mut updated = svm.get_account(&position).unwrap();
+        state.state.trade_id += 1;
+        state.state.updated_at_slot = current_clock.slot;
+        state.state.size_in_usd -= delta;
+        if full || forced {
+            state.state.size_in_usd = 0;
+            state.state.size_in_tokens = 0;
+            state.state.collateral_amount = 0;
+        } else {
+            state.state.collateral_amount -= 10_000_000;
+        }
+        updated.data[8..].copy_from_slice(bytemuck::bytes_of(&*state));
+        svm.set_account(position, updated).unwrap();
+        let payout = if full { 20_000_000 } else { 9_000_000 };
+        let mut escrow_account = svm.get_account(&escrow).unwrap();
+        let mut t = spl_token::state::Account::unpack(&escrow_account.data).unwrap();
+        t.amount = payout;
+        spl_token::state::Account::pack(t, &mut escrow_account.data).unwrap();
+        svm.set_account(escrow, escrow_account).unwrap();
+        if forced {
+            assert!(
+                expect_failure(svm, &keeper, recover.clone()).contains("UnprovenOrderExecution")
+            );
+            let mut accept = recover.clone();
+            accept.data = xau_carry_vault::instruction::AcceptFullCloseDecreaseV1 {}.data();
+            assert!(
+                expect_failure(svm, &keeper, accept.clone()).contains("UnauthorizedStrategyAdmin")
+            );
+            accept.accounts[0].pubkey = admin.pubkey();
+            send(svm, admin, accept);
+        } else {
+            send(svm, &keeper, recover.clone());
+        }
+        assert_eq!(
+            token_amount(svm, custody),
+            custody_before + source_before + payout
+        );
+        assert_eq!(token_amount(svm, source), 0);
+        assert_uncreated(svm, pending);
+        assert_uncreated(svm, baseline_address);
+        assert_uncreated(svm, order);
+        assert_uncreated(svm, escrow);
+        expect_failure(svm, &keeper, recover);
+    }
+    println!("Partial/full decrease reconciliation returned proceeds to custody; pending cancellation requires admin");
 }

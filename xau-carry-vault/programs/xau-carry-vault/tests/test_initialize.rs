@@ -39,10 +39,12 @@ struct Fixture {
 
 impl Fixture {
     fn new(usdc_decimals: u8) -> Self {
+        Self::new_with_mint(usdc_decimals, Keypair::new().pubkey())
+    }
+    fn new_with_mint(usdc_decimals: u8, usdc_mint: Pubkey) -> Self {
         let program_id = xau_carry_vault::id();
         let admin = Keypair::new();
         let user = Keypair::new();
-        let usdc_mint = Keypair::new().pubkey();
 
         let mut svm = LiteSVM::new();
 
@@ -1873,3 +1875,6 @@ fn vault_admin_transfer_requires_proposal_and_acceptance() {
     let error = f.set_pauses(true, true, true).unwrap_err();
     assert!(error.contains("UnauthorizedStrategyAdmin"), "{error}");
 }
+
+#[path = "common/strategy_handlers.rs"]
+mod strategy_handler_tests;

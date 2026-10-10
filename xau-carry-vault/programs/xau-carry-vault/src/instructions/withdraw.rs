@@ -68,7 +68,7 @@ pub struct WithdrawUsdcV1<'info> {
     pub user_usdc_ata: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Canonical strategy PDA is constrained.
-    /// The handler requires strategy configuration to be absent.
+    /// Configured strategies require the authenticated NAV remaining accounts.
     #[account(
         seeds = [
             STRATEGY_SEED,
@@ -96,8 +96,12 @@ pub fn handle_withdraw(
     require!(amount > 0, VaultError::ZeroAmount);
     require!(min_assets_out > 0, VaultError::InvalidMinimumOutput);
 
-    crate::instructions::read_idle_nav::require_idle_strategy(
+    let nav = crate::strategy_nav::quote(
+        ctx.accounts.vault_v1_state.key(),
+        &ctx.accounts.vault_v1_state,
         &ctx.accounts.strategy_account.to_account_info(),
+        ctx.accounts.vault_v1_usdc_account.amount,
+        ctx.remaining_accounts,
     )?;
 
     require!(
@@ -105,11 +109,21 @@ pub fn handle_withdraw(
         VaultError::InsufficientReceipts
     );
 
-    let assets_out = crate::share_math::assets_for_redemption(
-        amount,
-        ctx.accounts.vxau_mint.supply,
-        ctx.accounts.vault_v1_usdc_account.amount,
-    )?;
+    let assets_out = if *ctx.accounts.strategy_account.owner == anchor_lang::system_program::ID {
+        crate::share_math::assets_for_redemption(
+            amount,
+            ctx.accounts.vxau_mint.supply,
+            nav.net_assets,
+        )?
+    } else {
+        crate::strategy_accounting::redemption_quote(
+            amount,
+            ctx.accounts.vxau_mint.supply,
+            nav,
+            min_assets_out,
+        )
+        .map_err(crate::strategy_nav::accounting_error)?
+    };
 
     // Never burn shares for an output rounded down to zero.
     require!(assets_out > 0, VaultError::RedemptionTooSmall);

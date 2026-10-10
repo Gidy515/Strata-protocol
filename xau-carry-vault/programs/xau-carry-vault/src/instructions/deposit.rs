@@ -69,7 +69,7 @@ pub struct DepositUsdcV1<'info> {
     pub user_vxau_ata: Box<Account<'info, TokenAccount>>,
 
     /// CHECK: Canonical strategy PDA is constrained.
-    /// The handler requires strategy configuration to be absent.
+    /// Configured strategies require the authenticated NAV remaining accounts.
     #[account(
         seeds = [
             STRATEGY_SEED,
@@ -92,8 +92,12 @@ pub fn handle_deposit(ctx: Context<DepositUsdcV1>, amount: u64, min_shares_out: 
     require!(amount > 0, VaultError::ZeroAmount);
     require!(min_shares_out > 0, VaultError::InvalidMinimumOutput);
 
-    crate::instructions::read_idle_nav::require_idle_strategy(
+    let nav = crate::strategy_nav::quote(
+        ctx.accounts.vault_v1_state.key(),
+        &ctx.accounts.vault_v1_state,
         &ctx.accounts.strategy_account.to_account_info(),
+        ctx.accounts.vault_v1_usdc_account.amount,
+        ctx.remaining_accounts,
     )?;
 
     let next_total = ctx
@@ -104,11 +108,21 @@ pub fn handle_deposit(ctx: Context<DepositUsdcV1>, amount: u64, min_shares_out: 
         .ok_or(VaultError::Overflow)?;
 
     // Read NAV and outstanding supply BEFORE the deposit.
-    let shares_out = crate::share_math::shares_for_deposit(
-        amount,
-        ctx.accounts.vxau_mint.supply,
-        ctx.accounts.vault_v1_usdc_account.amount,
-    )?;
+    let shares_out = if *ctx.accounts.strategy_account.owner == anchor_lang::system_program::ID {
+        crate::share_math::shares_for_deposit(
+            amount,
+            ctx.accounts.vxau_mint.supply,
+            nav.net_assets,
+        )?
+    } else {
+        crate::strategy_accounting::deposit_quote(
+            amount,
+            ctx.accounts.vxau_mint.supply,
+            nav,
+            min_shares_out,
+        )
+        .map_err(crate::strategy_nav::accounting_error)?
+    };
 
     require!(
         shares_out >= min_shares_out,

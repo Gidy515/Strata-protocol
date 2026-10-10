@@ -12,7 +12,7 @@ use crate::{
     adapters::gmtrade::{create_short_order_instruction, ShortIncreaseParams, ShortOrderAccounts},
     constants::*,
     error::VaultError,
-    state::{PendingShortOrderV1, StrategyV1State, VaultV1State},
+    state::{OrderBaselineV1, PendingShortOrderV1, StrategyV1State, VaultV1State},
 };
 
 #[derive(AnchorSerialize, AnchorDeserialize, Clone)]
@@ -188,6 +188,11 @@ pub struct CreateShortOrderV1<'info> {
     )]
     pub pending_short_order: Box<Account<'info, PendingShortOrderV1>>,
 
+    /// CHECK: Canonical extension PDA. Created and serialized in a separate
+    /// function to keep Anchor's generated account-validation stack below 4 KiB.
+    #[account(mut, seeds = [ORDER_BASELINE_SEED, perpetual_order.key().as_ref()], bump)]
+    pub order_baseline: UncheckedAccount<'info>,
+
     /// CHECK: Exact event-authority PDA is checked.
     #[account(
         seeds = [GMTRADE_EVENT_AUTHORITY_SEED],
@@ -354,6 +359,27 @@ pub fn handle_create_short_order(
     );
 
     validate_market_and_position(&ctx)?;
+    let (_, before) = crate::adapters::gmtrade_accounts::market_and_position(
+        &ctx.accounts.perpetual_market.to_account_info(),
+        &ctx.accounts.perpetual_position.to_account_info(),
+        ctx.accounts.strategy_authority.key(),
+        ctx.accounts.usdc_mint.key(),
+    )?;
+    let baseline = OrderBaselineV1 {
+        vault: ctx.accounts.vault_v1_state.key(),
+        order: ctx.accounts.perpetual_order.key(),
+        position: ctx.accounts.perpetual_position.key(),
+        nonce,
+        refund: ctx.accounts.admin.key(),
+        submitted_slot: Clock::get()?.slot,
+        size_before: before.state.size_in_usd,
+        collateral_before: before.state.collateral_amount,
+        trade_id_before: before.state.trade_id,
+        expected_size_delta: params.size_delta_value,
+        bump: ctx.bumps.order_baseline,
+    };
+    persist_baseline(&ctx, &baseline)?;
+    drop(before);
 
     require!(
         ctx.accounts.vault_v1_usdc_account.amount >= params.collateral_amount,
@@ -500,5 +526,71 @@ pub fn handle_create_short_order(
             bump: ctx.bumps.pending_short_order,
         });
 
+    Ok(())
+}
+
+#[inline(never)]
+fn persist_baseline(ctx: &Context<CreateShortOrderV1>, baseline: &OrderBaselineV1) -> Result<()> {
+    use anchor_lang::system_program::{Allocate, Assign, CreateAccount};
+    let info = ctx.accounts.order_baseline.to_account_info();
+    require!(
+        info.owner == &anchor_lang::system_program::ID && info.data_is_empty() && !info.executable,
+        VaultError::InvalidOrderBaseline
+    );
+    let space = 8 + OrderBaselineV1::INIT_SPACE;
+    let rent = Rent::get()?.minimum_balance(space);
+    let order = baseline.order;
+    let bump = [baseline.bump];
+    let seeds: &[&[u8]] = &[ORDER_BASELINE_SEED, order.as_ref(), &bump];
+    if info.lamports() == 0 {
+        system_program::create_account(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.key(),
+                CreateAccount {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: info.clone(),
+                },
+                &[seeds],
+            ),
+            rent,
+            space as u64,
+            &crate::ID,
+        )?;
+    } else {
+        let extra = rent.saturating_sub(info.lamports());
+        if extra > 0 {
+            system_program::transfer(
+                CpiContext::new(
+                    ctx.accounts.system_program.key(),
+                    Transfer {
+                        from: ctx.accounts.admin.to_account_info(),
+                        to: info.clone(),
+                    },
+                ),
+                extra,
+            )?;
+        }
+        system_program::allocate(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.key(),
+                Allocate {
+                    account_to_allocate: info.clone(),
+                },
+                &[seeds],
+            ),
+            space as u64,
+        )?;
+        system_program::assign(
+            CpiContext::new_with_signer(
+                ctx.accounts.system_program.key(),
+                Assign {
+                    account_to_assign: info.clone(),
+                },
+                &[seeds],
+            ),
+            &crate::ID,
+        )?;
+    }
+    baseline.try_serialize(&mut &mut info.try_borrow_mut_data()?[..])?;
     Ok(())
 }

@@ -8,7 +8,7 @@ use crate::{
     adapters::gmtrade::{close_short_order_instruction, ShortOrderAccounts},
     constants::*,
     error::VaultError,
-    state::{PendingShortOrderV1, StrategyV1State, VaultV1State},
+    state::{OrderBaselineV1, PendingShortOrderV1, StrategyV1State, VaultV1State},
 };
 
 #[derive(Accounts)]
@@ -62,6 +62,13 @@ pub struct CancelShortOrderV1<'info> {
             @ VaultError::InvalidPendingOrder
     )]
     pub pending_short_order: Box<Account<'info, PendingShortOrderV1>>,
+
+    // Optional only for legacy orders submitted before this extension existed.
+    #[account(mut, close = admin, seeds = [ORDER_BASELINE_SEED, perpetual_order.key().as_ref()],
+        bump = order_baseline.bump,
+        constraint = order_baseline.order == pending_short_order.order @ VaultError::InvalidOrderBaseline,
+        constraint = order_baseline.vault == vault_v1_state.key() @ VaultError::InvalidOrderBaseline)]
+    pub order_baseline: Option<Box<Account<'info, OrderBaselineV1>>>,
 
     #[account(
         constraint = usdc_mint.key().to_string()
@@ -256,7 +263,7 @@ pub fn handle_cancel_short_order(ctx: Context<CancelShortOrderV1>) -> Result<()>
 
         // ActionState::Pending = 0.
         // Completed orders need a separate reconciliation path.
-        require!(data[9] == 0, VaultError::OrderNotPending);
+        require!(data[9] == 0 || data[9] == 2, VaultError::OrderNotPending);
 
         require_keys_eq!(
             read_pubkey(&data, 24)?,

@@ -203,7 +203,7 @@ pub struct CompleteWithdrawalV1<'info> {
     )]
     pub owner_vxau_ata: Box<Account<'info, TokenAccount>>,
 
-    /// CHECK: Canonical PDA. Settlement requires absence;
+    /// CHECK: Canonical PDA. Settlement authenticates full strategy NAV;
     /// cancellation does not depend on strategy state.
     #[account(
         seeds = [STRATEGY_SEED, vault_v1_state.key().as_ref()],
@@ -240,15 +240,28 @@ pub fn handle_complete(ctx: Context<CompleteWithdrawalV1>, cancel: bool) -> Resu
             VaultError::WithdrawalsPaused
         );
 
-        super::read_idle_nav::require_idle_strategy(
+        let nav = crate::strategy_nav::quote(
+            ctx.accounts.vault_v1_state.key(),
+            &ctx.accounts.vault_v1_state,
             &ctx.accounts.strategy_account.to_account_info(),
-        )?;
-
-        let assets = crate::share_math::assets_for_redemption(
-            recorded_shares,
-            ctx.accounts.vxau_mint.supply,
             ctx.accounts.vault_v1_usdc_account.amount,
+            ctx.remaining_accounts,
         )?;
+        let assets = if *ctx.accounts.strategy_account.owner == anchor_lang::system_program::ID {
+            crate::share_math::assets_for_redemption(
+                recorded_shares,
+                ctx.accounts.vxau_mint.supply,
+                nav.net_assets,
+            )?
+        } else {
+            crate::strategy_accounting::redemption_quote(
+                recorded_shares,
+                ctx.accounts.vxau_mint.supply,
+                nav,
+                request.min_assets_out,
+            )
+            .map_err(crate::strategy_nav::accounting_error)?
+        };
 
         require!(assets > 0, VaultError::RedemptionTooSmall);
         require!(

@@ -170,10 +170,6 @@ fn validate_external_accounts(ctx: &Context<ConfigureStrategyV1>) -> Result<()> 
 }
 
 pub fn handle_configure_strategy(ctx: Context<ConfigureStrategyV1>) -> Result<()> {
-    require_unfunded_configuration(
-        ctx.accounts.vault_v1_state.total_deposited,
-    )?;
-
     validate_external_accounts(&ctx)?;
 
     ctx.accounts.strategy_v1_state.set_inner(StrategyV1State {
@@ -192,34 +188,6 @@ pub fn handle_configure_strategy(ctx: Context<ConfigureStrategyV1>) -> Result<()
     Ok(())
 }
 
-// Configuration currently blocks redemption and queued settlement.
-// Until full strategy NAV is integrated, only vaults that have never
-// accepted deposits may enter this development configuration.
-fn require_unfunded_configuration(
-    total_deposited: u64,
-) -> Result<()> {
-    require!(
-        total_deposited == 0,
-        VaultError::FullStrategyNavRequired
-    );
-
-    Ok(())
-}
-
-#[cfg(test)]
-mod configuration_safety_tests {
-    use super::*;
-
-    #[test]
-    fn unfunded_configuration_is_allowed() {
-        assert!(require_unfunded_configuration(0).is_ok());
-    }
-
-    #[test]
-    fn deposit_history_blocks_configuration_until_full_nav_exists() {
-        assert!(require_unfunded_configuration(1).is_err());
-        assert!(
-            require_unfunded_configuration(u64::MAX).is_err()
-        );
-    }
-}
+// Configuration remains admin-only and starts with execution disabled.
+// Funded vaults can configure now: deposit/redemption/settlement all authenticate
+// full strategy NAV instead of treating configured strategies as idle custody.
