@@ -1,0 +1,10 @@
+[workspace]
+[package]
+name = "strata-test-router"
+version = "0.1.0"
+edition = "2021"
+[lib]
+crate-type = ["cdylib", "lib"]
+[dependencies]
+anchor-lang = "=1.2.0"
+anchor-spl = "=1.2.0"

@@ -1,0 +1,6280 @@
+
+
+===== Cargo.toml =====
+
+[workspace]
+members = [
+    "programs/*"
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+rust-version = "1.89.0"
+
+[profile.release]
+overflow-checks = true
+lto = "fat"
+codegen-units = 1
+[profile.release.build-override]
+opt-level = 3
+incremental = false
+codegen-units = 1
+
+
+===== Anchor.toml =====
+
+skip_local_validator = true
+
+[toolchain]
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+basket-weighted-vault = "9zhhveFur9Kx6MCxYLLL4JiGAGWhY2bsjL9agcYY3BE2"
+xau_carry_vault = "7UjnUp67WKZXAF3gRV4pZgaD6qsWE13gCu116VXsA5cb"
+
+[provider]
+cluster = "localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "cargo test"
+
+[hooks]
+
+
+===== programs/xau-carry-vault/Cargo.toml =====
+
+[package]
+name = "xau-carry-vault"
+version = "0.1.0"
+description = "Strata USDC deposit and vXAU receipt vault"
+edition.workspace = true
+rust-version.workspace = true
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "xau_carry_vault"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+anchor-debug = []
+custom-heap = []
+custom-panic = []
+
+[dependencies]
+anchor-lang = { version = "=1.1.2", features = ["init-if-needed"] }
+anchor-spl = "=1.1.2"
+
+[dev-dependencies]
+litesvm = "0.10.0"
+solana-message = "3.0.1"
+solana-transaction = "3.0.2"
+solana-signer = "3.0.0"
+solana-keypair = "3.0.1"
+solana-account = "3.0"
+solana-program-pack = "3.0"
+solana-program-option = "3.0"
+base64 = "0.22"
+serde_json = "1.0"
+solana-last-restart-slot = "3.0"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }
+
+===== programs/xau-carry-vault/src/adapters/gmtrade.rs =====
+
+use anchor_lang::{
+    prelude::*,
+    solana_program::{
+        instruction::{AccountMeta, Instruction},
+        system_program,
+    },
+};
+use anchor_spl::{associated_token::get_associated_token_address, token};
+
+use crate::{constants::*, error::VaultError};
+
+const CREATE_ORDER_V2_DISCRIMINATOR: [u8; 8] = [200, 157, 3, 182, 3, 164, 162, 240];
+
+const ORDER_SEED: &[u8] = b"order";
+const EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+
+/// Inputs for a market short-increase order.
+///
+/// `collateral_amount` uses USDC base units.
+///
+/// `size_delta_value` and `acceptable_price` use GMTrade's
+/// native value/price precision. They are not USDC base units.
+///
+/// The eventual handler must validate pricing, exposure limits,
+/// share-accounting readiness, and token-account contents.
+pub struct ShortIncreaseParams {
+    pub collateral_amount: u64,
+    pub size_delta_value: u128,
+    pub acceptable_price: u128,
+    pub execution_lamports: u64,
+}
+
+/// Addresses supplied after the handler validates their account data.
+///
+/// The adapter checks program, market, store, mint, and derivable
+/// user/order/escrow/source addresses. The position account's metadata
+/// and its full PDA derivation must be checked by the handler.
+pub struct ShortOrderAccounts {
+    pub perpetual_program: Pubkey,
+    pub strategy_authority: Pubkey,
+    pub store: Pubkey,
+    pub market: Pubkey,
+    pub user: Pubkey,
+    pub order: Pubkey,
+    pub position: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub order_usdc_escrow: Pubkey,
+    pub strategy_usdc_source: Pubkey,
+}
+
+/// Derives the external order address.
+pub fn order_address(
+    program: &Pubkey,
+    store: &Pubkey,
+    authority: &Pubkey,
+    nonce: &[u8; 32],
+) -> (Pubkey, u8) {
+    Pubkey::find_program_address(
+        &[ORDER_SEED, store.as_ref(), authority.as_ref(), nonce],
+        program,
+    )
+}
+
+fn validate_addresses(accounts: &ShortOrderAccounts, nonce: &[u8; 32]) -> Result<()> {
+    require!(
+        accounts.perpetual_program.to_string() == GMTRADE_PROGRAM_ADDRESS,
+        VaultError::InvalidPerpetualProgram
+    );
+
+    require!(
+        accounts.store.to_string() == GMTRADE_STORE_ADDRESS,
+        VaultError::InvalidPerpetualStore
+    );
+
+    require!(
+        accounts.market.to_string() == GMTRADE_XAU_MARKET_ADDRESS,
+        VaultError::InvalidPerpetualMarket
+    );
+
+    require!(
+        accounts.usdc_mint.to_string() == MAINNET_USDC_MINT,
+        VaultError::InvalidStrategyDepositMint
+    );
+
+    let (expected_user, _) = Pubkey::find_program_address(
+        &[
+            GMTRADE_USER_SEED,
+            accounts.store.as_ref(),
+            accounts.strategy_authority.as_ref(),
+        ],
+        &accounts.perpetual_program,
+    );
+
+    require_keys_eq!(
+        accounts.user,
+        expected_user,
+        VaultError::InvalidPerpetualUser
+    );
+
+    let (expected_order, _) = order_address(
+        &accounts.perpetual_program,
+        &accounts.store,
+        &accounts.strategy_authority,
+        nonce,
+    );
+
+    require_keys_eq!(
+        accounts.order,
+        expected_order,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    let expected_escrow = get_associated_token_address(&accounts.order, &accounts.usdc_mint);
+
+    require_keys_eq!(
+        accounts.order_usdc_escrow,
+        expected_escrow,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    let expected_source =
+        get_associated_token_address(&accounts.strategy_authority, &accounts.usdc_mint);
+
+    require_keys_eq!(
+        accounts.strategy_usdc_source,
+        expected_source,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    Ok(())
+}
+
+fn encode_short_increase(nonce: &[u8; 32], params: &ShortIncreaseParams) -> Vec<u8> {
+    let mut data = CREATE_ORDER_V2_DISCRIMINATOR.to_vec();
+
+    // create_order_v2 argument 1: nonce.
+    data.extend_from_slice(nonce);
+
+    // Argument 2: CreateOrderParams, in published Borsh field order.
+
+    // OrderKind::MarketIncrease.
+    data.push(3);
+
+    // decrease_position_swap_type: None.
+    data.push(0);
+
+    data.extend_from_slice(&params.execution_lamports.to_le_bytes());
+
+    // swap_path_length: no collateral swap.
+    data.push(0);
+
+    data.extend_from_slice(&params.collateral_amount.to_le_bytes());
+    data.extend_from_slice(&params.size_delta_value.to_le_bytes());
+
+    // is_long: false -> short.
+    data.push(0);
+
+    // is_collateral_long: false -> short-side collateral.
+    data.push(0);
+
+    // min_output: None.
+    data.push(0);
+
+    // trigger_price: None; this is a market order.
+    data.push(0);
+
+    // acceptable_price: Some.
+    data.push(1);
+    data.extend_from_slice(&params.acceptable_price.to_le_bytes());
+
+    // should_unwrap_native_token: false.
+    data.push(0);
+
+    // valid_from_ts: None.
+    data.push(0);
+
+    // Argument 3: callback_version: None.
+    data.push(0);
+
+    data
+}
+
+/// Builds the CPI instruction. This function does not invoke it.
+///
+/// Receiver is always the strategy authority, keeping outputs under
+/// vault control. Callbacks and swap paths are omitted.
+pub fn create_short_order_instruction(
+    accounts: &ShortOrderAccounts,
+    nonce: &[u8; 32],
+    params: &ShortIncreaseParams,
+) -> Result<Instruction> {
+    require!(
+        params.collateral_amount > 0 && params.size_delta_value > 0 && params.acceptable_price > 0,
+        VaultError::InvalidShortOrderParameters
+    );
+
+    validate_addresses(accounts, nonce)?;
+
+    let program = accounts.perpetual_program;
+    let authority = accounts.strategy_authority;
+    let mint = accounts.usdc_mint;
+    let escrow = accounts.order_usdc_escrow;
+
+    let (event_authority, _) = Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &program);
+
+    // Anchor encodes an absent optional account using the called
+    // program ID as a readonly placeholder.
+    let absent = AccountMeta::new_readonly(program, false);
+
+    Ok(Instruction {
+        program_id: program,
+        accounts: vec![
+            // 0: owner.
+            AccountMeta::new(authority, true),
+            // 1: receiver.
+            AccountMeta::new_readonly(authority, false),
+            // 2: store.
+            AccountMeta::new_readonly(accounts.store, false),
+            // 3: market.
+            AccountMeta::new(accounts.market, false),
+            // 4: user.
+            AccountMeta::new(accounts.user, false),
+            // 5: order.
+            AccountMeta::new(accounts.order, false),
+            // 6: position.
+            AccountMeta::new(accounts.position, false),
+            // 7: initial_collateral_token.
+            AccountMeta::new_readonly(mint, false),
+            // 8: final_output_token.
+            AccountMeta::new_readonly(mint, false),
+            // 9: long_token.
+            AccountMeta::new_readonly(mint, false),
+            // 10: short_token.
+            AccountMeta::new_readonly(mint, false),
+            // 11: initial_collateral_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 12: final_output_token_escrow: omitted.
+            absent.clone(),
+            // 13: long_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 14: short_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 15: initial_collateral_token_source.
+            AccountMeta::new(accounts.strategy_usdc_source, false),
+            // 16: system_program.
+            AccountMeta::new_readonly(system_program::ID, false),
+            // 17: token_program.
+            AccountMeta::new_readonly(token::ID, false),
+            // 18: associated_token_program.
+            AccountMeta::new_readonly(anchor_spl::associated_token::ID, false),
+            // 19: callback_authority: omitted.
+            absent.clone(),
+            // 20: callback_program: omitted.
+            absent.clone(),
+            // 21: callback_shared_data_account: omitted.
+            absent.clone(),
+            // 22: callback_partitioned_data_account: omitted.
+            absent,
+            // 23: event_authority.
+            AccountMeta::new_readonly(event_authority, false),
+            // 24: program, required by event CPI.
+            AccountMeta::new_readonly(program, false),
+        ],
+        data: encode_short_increase(nonce, params),
+    })
+}
+
+const CLOSE_ORDER_V2_DISCRIMINATOR: [u8; 8] = [213, 217, 98, 100, 225, 205, 76, 184];
+
+const STORE_WALLET_SEED: &[u8] = b"store_wallet";
+
+/// Derives GMTrade's system-owned store wallet.
+pub fn store_wallet_address(program: &Pubkey, store: &Pubkey) -> (Pubkey, u8) {
+    Pubkey::find_program_address(&[STORE_WALLET_SEED, store.as_ref()], program)
+}
+
+/// Builds close_order_v2 for an order created by our short-increase
+/// adapter: USDC collateral, no callbacks, no final-output escrow.
+///
+/// This only builds an instruction.
+///
+/// The caller must:
+/// - validate the pending record and external order state;
+/// - sign as the strategy authority;
+/// - verify closure and refund after CPI;
+/// - transfer recovered collateral into vault custody;
+/// - clear the pending record only after those checks succeed.
+///
+/// It is not a general reconciliation adapter for executed orders.
+pub fn close_short_order_instruction(
+    accounts: &ShortOrderAccounts,
+    nonce: &[u8; 32],
+) -> Result<Instruction> {
+    validate_addresses(accounts, nonce)?;
+
+    let program = accounts.perpetual_program;
+    let authority = accounts.strategy_authority;
+    let mint = accounts.usdc_mint;
+    let escrow = accounts.order_usdc_escrow;
+    let refund_ata = accounts.strategy_usdc_source;
+
+    let (store_wallet, _) = store_wallet_address(&program, &accounts.store);
+
+    let (event_authority, _) = Pubkey::find_program_address(&[EVENT_AUTHORITY_SEED], &program);
+
+    let absent = AccountMeta::new_readonly(program, false);
+
+    // Borsh string: u32 byte length followed by UTF-8 bytes.
+    let reason = b"Strata: cancel pending short order";
+
+    let mut data = CLOSE_ORDER_V2_DISCRIMINATOR.to_vec();
+    data.extend_from_slice(&(reason.len() as u32).to_le_bytes());
+    data.extend_from_slice(reason);
+
+    Ok(Instruction {
+        program_id: program,
+        accounts: vec![
+            // 0: executor. The strategy authority signs through CPI.
+            AccountMeta::new_readonly(authority, true),
+            // 1: store.
+            AccountMeta::new(accounts.store, false),
+            // 2: store_wallet.
+            AccountMeta::new(store_wallet, false),
+            // 3: owner.
+            AccountMeta::new(authority, false),
+            // 4: receiver.
+            AccountMeta::new(authority, false),
+            // 5: rent_receiver.
+            AccountMeta::new(authority, false),
+            // 6: user.
+            AccountMeta::new(accounts.user, false),
+            // 7: referrer_user: omitted.
+            absent.clone(),
+            // 8: order.
+            AccountMeta::new(accounts.order, false),
+            // 9: initial_collateral_token.
+            AccountMeta::new_readonly(mint, false),
+            // 10: final_output_token: omitted.
+            absent.clone(),
+            // 11: long_token.
+            AccountMeta::new_readonly(mint, false),
+            // 12: short_token.
+            AccountMeta::new_readonly(mint, false),
+            // 13: initial_collateral_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 14: final_output_token_escrow: omitted.
+            absent.clone(),
+            // 15: long_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 16: short_token_escrow.
+            AccountMeta::new(escrow, false),
+            // 17: initial_collateral_token_ata.
+            AccountMeta::new(refund_ata, false),
+            // 18: final_output_token_ata: omitted.
+            absent.clone(),
+            // 19: long_token_ata.
+            AccountMeta::new(refund_ata, false),
+            // 20: short_token_ata.
+            AccountMeta::new(refund_ata, false),
+            // 21: system_program.
+            AccountMeta::new_readonly(system_program::ID, false),
+            // 22: token_program.
+            AccountMeta::new_readonly(token::ID, false),
+            // 23: associated_token_program.
+            AccountMeta::new_readonly(anchor_spl::associated_token::ID, false),
+            // 24: callback_authority: omitted.
+            absent.clone(),
+            // 25: callback_program: omitted.
+            absent.clone(),
+            // 26: callback_shared_data_account: omitted.
+            absent.clone(),
+            // 27: callback_partitioned_data_account: omitted.
+            absent,
+            // 28: event_authority.
+            AccountMeta::new_readonly(event_authority, false),
+            // 29: program.
+            AccountMeta::new_readonly(program, false),
+        ],
+        data,
+    })
+}
+
+
+===== programs/xau-carry-vault/src/adapters/mod.rs =====
+
+pub mod gmtrade;
+
+
+===== programs/xau-carry-vault/src/constants.rs =====
+
+use anchor_lang::prelude::*;
+
+pub const VAULT_SEED: &[u8] = b"vault_v1";
+pub const TOKEN_VAULT_SEED: &[u8] = b"token_vault";
+pub const VXAU_MINT_SEED: &[u8] = b"vxau_mint";
+
+pub const RECEIPT_DECIMALS: u8 = 6;
+
+pub const STRATEGY_SEED: &[u8] = b"strategy_v1";
+pub const GOLD_VAULT_SEED: &[u8] = b"gold_vault";
+
+pub const MAINNET_USDC_MINT: &str = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
+
+pub const PAXG_MINT_ADDRESS: &str = "5GgRAEmv8ZxF2PR5hY72Qs5x1bnQ6UK2RbTPoqJ3wSwW";
+
+pub const GMTRADE_PROGRAM_ADDRESS: &str = "Gmso1uvJnLbawvw7yezdfCDcPydwW2s2iqG3w6MDucLo";
+
+pub const GMTRADE_STORE_ADDRESS: &str = "CTDLvGGXnoxvqLyTpGzdGLg9pD6JexKxKXSV8tqqo8bN";
+
+pub const GMTRADE_XAU_MARKET_ADDRESS: &str = "59uFARJWg7B8wcEuXzvkafiT4DuKemdNCN5bshDbwun9";
+
+pub const GMTRADE_XAU_INDEX_ADDRESS: &str = "Xauxf2VJhbue14FGbp3W8XwfQSECHYpiPMNMWSCwjSR";
+
+pub const GMTRADE_MARKET_DISCRIMINATOR: [u8; 8] = [219, 190, 213, 55, 0, 227, 198, 154];
+
+pub const GMTRADE_STORE_DISCRIMINATOR: [u8; 8] = [130, 48, 247, 244, 182, 191, 30, 26];
+
+pub const GOLD_DECIMALS: u8 = 6;
+
+pub const STRATEGY_AUTHORITY_SEED: &[u8] = b"strategy_authority";
+pub const GMTRADE_USER_SEED: &[u8] = b"user";
+
+pub const GMTRADE_PREPARE_USER_DISCRIMINATOR: [u8; 8] = [190, 173, 143, 193, 139, 80, 231, 133];
+
+pub const GMTRADE_USER_DISCRIMINATOR: [u8; 8] = [12, 78, 211, 244, 225, 77, 209, 249];
+
+pub const GMTRADE_POSITION_SEED: &[u8] = b"position";
+pub const GMTRADE_SHORT_POSITION_KIND: u8 = 2;
+
+pub const GMTRADE_PREPARE_POSITION_DISCRIMINATOR: [u8; 8] = [178, 215, 55, 90, 137, 15, 108, 15];
+
+pub const GMTRADE_POSITION_DISCRIMINATOR: [u8; 8] = [170, 188, 143, 228, 122, 64, 247, 208];
+
+pub const PENDING_SHORT_ORDER_SEED: &[u8] = b"pending_short_order";
+pub const GMTRADE_ORDER_SEED: &[u8] = b"order";
+pub const GMTRADE_EVENT_AUTHORITY_SEED: &[u8] = b"__event_authority";
+
+pub const GMTRADE_ORDER_DISCRIMINATOR: [u8; 8] = [134, 173, 223, 185, 77, 86, 28, 51];
+
+
+===== programs/xau-carry-vault/src/error.rs =====
+
+use anchor_lang::prelude::*;
+
+#[error_code]
+pub enum VaultError {
+    #[msg("Only the program upgrade authority may initialize a vault")]
+    Unauthorized,
+
+    #[msg("The deposit mint must have six decimals")]
+    InvalidDecimals,
+
+    #[msg("Deposit amount must be greater than zero")]
+    ZeroAmount,
+
+    #[msg("Cumulative deposits overflowed")]
+    Overflow,
+
+    #[msg("Insufficient vXAU receipts to redeem")]
+    InsufficientReceipts,
+
+    #[msg("Insufficient USDC available in vault custody")]
+    InsufficientLiquidity,
+
+    #[msg("Only the recorded vault administrator may configure the strategy")]
+    UnauthorizedStrategyAdmin,
+
+    #[msg("The configured strategy requires mainnet USDC")]
+    InvalidStrategyDepositMint,
+
+    #[msg("Unexpected gold mint")]
+    InvalidGoldMint,
+
+    #[msg("The gold mint must have six decimals")]
+    InvalidGoldDecimals,
+
+    #[msg("Unexpected perpetual program")]
+    InvalidPerpetualProgram,
+
+    #[msg("Unexpected perpetual store")]
+    InvalidPerpetualStore,
+
+    #[msg("Unexpected perpetual market")]
+    InvalidPerpetualMarket,
+
+    #[msg("Unsupported external account layout or version")]
+    InvalidExternalAccountData,
+
+    #[msg("The perpetual market is disabled or closed")]
+    PerpetualMarketUnavailable,
+
+    #[msg("The perpetual market collateral does not match vault USDC")]
+    InvalidPerpetualCollateral,
+
+    #[msg("Unexpected perpetual index identifier")]
+    InvalidPerpetualIndex,
+
+    #[msg("Strategy configuration does not belong to this vault")]
+    InvalidStrategyVault,
+
+    #[msg("The strategy authority must be a system-owned account without data")]
+    InvalidStrategyAuthority,
+
+    #[msg("Unexpected perpetual user account")]
+    InvalidPerpetualUser,
+
+    #[msg("Unexpected perpetual short-position account")]
+    InvalidPerpetualPosition,
+
+    #[msg("Short-order collateral, size, and acceptable price must be positive")]
+    InvalidShortOrderParameters,
+
+    #[msg("Unexpected perpetual order or escrow address")]
+    InvalidPerpetualOrderAccounts,
+
+    #[msg("Strategy execution is disabled")]
+    StrategyExecutionDisabled,
+
+    #[msg("The vault has insufficient idle USDC for this order")]
+    InsufficientStrategyCollateral,
+
+    #[msg("The order escrow must be empty before submission")]
+    OrderEscrowNotEmpty,
+
+    #[msg("Unexpected token balances after order creation")]
+    InvalidOrderCollateralAccounting,
+
+    #[msg("Pending order does not match this vault")]
+    InvalidPendingOrder,
+
+    #[msg("Only an unexecuted pending order can use this cancellation path")]
+    OrderNotPending,
+
+    #[msg("External order closure did not complete")]
+    OrderClosureIncomplete,
+
+    #[msg("Cancellation did not return the recorded collateral")]
+    InvalidCancellationRefund,
+
+    #[msg("A new vault cannot bootstrap shares against existing unowned assets")]
+    InvalidShareBootstrap,
+
+    #[msg("Outstanding shares exist but the vault has zero net assets")]
+    VaultInsolvent,
+
+    #[msg("The deposit is too small to mint one share base unit")]
+    DepositTooSmall,
+
+    #[msg("Invalid gold price or oracle validation limits")]
+    InvalidGoldPrice,
+
+    #[msg("Gold price is stale or has a future publication timestamp")]
+    InvalidGoldPriceTimestamp,
+
+    #[msg("Gold price confidence interval exceeds the accepted limit")]
+    GoldPriceTooUncertain,
+
+    #[msg("Unexpected oracle account owner")]
+    InvalidOracleOwner,
+
+    #[msg("Unsupported oracle account format")]
+    InvalidOracleAccount,
+
+    #[msg("Oracle feed does not match the configured asset")]
+    InvalidOracleFeed,
+
+    #[msg("Oracle update is not fully verified")]
+    OracleNotFullyVerified,
+
+    #[msg("Oracle update was posted in a future slot")]
+    InvalidOracleSlot,
+
+    #[msg("A configured strategy requires full strategy NAV accounting")]
+    FullStrategyNavRequired,
+
+    #[msg("Minimum output must be greater than zero")]
+    InvalidMinimumOutput,
+
+    #[msg("Calculated output is below the user's minimum")]
+    MinimumOutputNotMet,
+
+    #[msg("The redemption is too small to return one USDC base unit")]
+    RedemptionTooSmall,
+}
+
+
+===== programs/xau-carry-vault/src/instructions/cancel_short_order.rs =====
+
+use anchor_lang::{prelude::*, solana_program::program::invoke_signed};
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token::{self, Mint, Token, TokenAccount, TransferChecked},
+};
+
+use crate::{
+    adapters::gmtrade::{close_short_order_instruction, ShortOrderAccounts},
+    constants::*,
+    error::VaultError,
+    state::{PendingShortOrderV1, StrategyV1State, VaultV1State},
+};
+
+#[derive(Accounts)]
+pub struct CancelShortOrderV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = admin @ VaultError::UnauthorizedStrategyAdmin,
+        has_one = usdc_mint
+    )]
+    pub vault_v1_state: Box<Account<'info, VaultV1State>>,
+
+    // No execution_enabled constraint: recovery must work while disabled.
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump = strategy_v1_state.bump,
+        constraint = strategy_v1_state.vault
+            == vault_v1_state.key()
+            @ VaultError::InvalidStrategyVault,
+        has_one = perpetual_program
+            @ VaultError::InvalidPerpetualProgram,
+        has_one = perpetual_store
+            @ VaultError::InvalidPerpetualStore
+    )]
+    pub strategy_v1_state: Box<Account<'info, StrategyV1State>>,
+
+    #[account(
+        mut,
+        close = admin,
+        seeds = [
+            PENDING_SHORT_ORDER_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump = pending_short_order.bump,
+        constraint = pending_short_order.vault
+            == vault_v1_state.key()
+            @ VaultError::InvalidPendingOrder,
+        constraint = pending_short_order.order
+            == perpetual_order.key()
+            @ VaultError::InvalidPendingOrder,
+        has_one = strategy_authority
+            @ VaultError::InvalidPendingOrder
+    )]
+    pub pending_short_order: Box<Account<'info, PendingShortOrderV1>>,
+
+    #[account(
+        constraint = usdc_mint.key().to_string()
+            == MAINNET_USDC_MINT
+            @ VaultError::InvalidStrategyDepositMint,
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            STRATEGY_AUTHORITY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        constraint = strategy_authority.to_account_info().data_is_empty()
+            @ VaultError::InvalidStrategyAuthority
+    )]
+    pub strategy_authority: SystemAccount<'info>,
+
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = strategy_authority
+    )]
+    pub strategy_usdc_source: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Program address and executable status checked in handler.
+    pub perpetual_program: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner checked in handler.
+    #[account(mut)]
+    pub perpetual_store: UncheckedAccount<'info>,
+
+    // SystemAccount checks system ownership; PDA checked in handler.
+    #[account(mut)]
+    pub perpetual_store_wallet: SystemAccount<'info>,
+
+    /// CHECK: External owner and user PDA checked in handler.
+    #[account(mut)]
+    pub perpetual_user: UncheckedAccount<'info>,
+
+    /// CHECK: External owner, PDA, and order header checked in handler.
+    #[account(mut)]
+    pub perpetual_order: UncheckedAccount<'info>,
+
+    // GMTrade closes this account during CPI. Do not reload afterward.
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = perpetual_order
+    )]
+    pub order_usdc_escrow: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: External event-authority PDA checked in handler.
+    pub perpetual_event_authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(VaultError::InvalidExternalAccountData)?;
+
+    let bytes: [u8; 32] = data
+        .get(offset..end)
+        .ok_or(VaultError::InvalidExternalAccountData)?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidExternalAccountData))?;
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+#[inline(never)]
+fn validate_external_accounts(ctx: &Context<CancelShortOrderV1>) -> Result<()> {
+    let program = ctx.accounts.perpetual_program.key();
+    let store = ctx.accounts.perpetual_store.key();
+    let authority = ctx.accounts.strategy_authority.key();
+    let nonce = ctx.accounts.pending_short_order.nonce;
+
+    require!(
+        program.to_string() == GMTRADE_PROGRAM_ADDRESS
+            && ctx.accounts.perpetual_program.to_account_info().executable,
+        VaultError::InvalidPerpetualProgram
+    );
+
+    require!(
+        store.to_string() == GMTRADE_STORE_ADDRESS,
+        VaultError::InvalidPerpetualStore
+    );
+
+    require_keys_eq!(
+        *ctx.accounts.perpetual_store.to_account_info().owner,
+        program,
+        VaultError::InvalidPerpetualStore
+    );
+
+    require_keys_eq!(
+        *ctx.accounts.perpetual_user.to_account_info().owner,
+        program,
+        VaultError::InvalidPerpetualUser
+    );
+
+    require_keys_eq!(
+        *ctx.accounts.perpetual_order.to_account_info().owner,
+        program,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    let (expected_wallet, _) =
+        Pubkey::find_program_address(&[b"store_wallet", store.as_ref()], &program);
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_store_wallet.key(),
+        expected_wallet,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    let (expected_user, _) = Pubkey::find_program_address(
+        &[GMTRADE_USER_SEED, store.as_ref(), authority.as_ref()],
+        &program,
+    );
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_user.key(),
+        expected_user,
+        VaultError::InvalidPerpetualUser
+    );
+
+    let (expected_order, _) = Pubkey::find_program_address(
+        &[
+            GMTRADE_ORDER_SEED,
+            store.as_ref(),
+            authority.as_ref(),
+            &nonce,
+        ],
+        &program,
+    );
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_order.key(),
+        expected_order,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    let (expected_event_authority, _) =
+        Pubkey::find_program_address(&[GMTRADE_EVENT_AUTHORITY_SEED], &program);
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_event_authority.key(),
+        expected_event_authority,
+        VaultError::InvalidPerpetualOrderAccounts
+    );
+
+    Ok(())
+}
+
+pub fn handle_cancel_short_order(ctx: Context<CancelShortOrderV1>) -> Result<()> {
+    validate_external_accounts(&ctx)?;
+
+    let authority = ctx.accounts.strategy_authority.key();
+    {
+        let data = ctx.accounts.perpetual_order.try_borrow_data()?;
+
+        // Version-zero Order starts with ActionHeader.
+        // Offsets include the eight-byte account discriminator.
+        require!(data.len() >= 272, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data.get(..8) == Some(GMTRADE_ORDER_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidPerpetualOrderAccounts
+        );
+
+        require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+        // ActionState::Pending = 0.
+        // Completed orders need a separate reconciliation path.
+        require!(data[9] == 0, VaultError::OrderNotPending);
+
+        require_keys_eq!(
+            read_pubkey(&data, 24)?,
+            ctx.accounts.perpetual_store.key(),
+            VaultError::InvalidPendingOrder
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 56)?,
+            ctx.accounts.strategy_v1_state.perpetual_market,
+            VaultError::InvalidPendingOrder
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 88)?,
+            authority,
+            VaultError::InvalidPendingOrder
+        );
+
+        require!(
+            data[120..152] == ctx.accounts.pending_short_order.nonce[..],
+            VaultError::InvalidPendingOrder
+        );
+
+        // A zero stored receiver falls back to the order owner/creator.
+        let rent_receiver = read_pubkey(&data, 208)?;
+        let output_receiver = read_pubkey(&data, 240)?;
+
+        require!(
+            (rent_receiver == Pubkey::default() || rent_receiver == authority)
+                && (output_receiver == Pubkey::default() || output_receiver == authority),
+            VaultError::InvalidPendingOrder
+        );
+    }
+
+    let collateral = ctx.accounts.pending_short_order.collateral_amount;
+
+    require!(
+        collateral > 0 && ctx.accounts.order_usdc_escrow.amount >= collateral,
+        VaultError::InvalidCancellationRefund
+    );
+
+    let source_before = ctx.accounts.strategy_usdc_source.amount;
+    let custody_before = ctx.accounts.vault_v1_usdc_account.amount;
+
+    let expected_source = source_before
+        .checked_add(collateral)
+        .ok_or(VaultError::Overflow)?;
+
+    let expected_custody = custody_before
+        .checked_add(collateral)
+        .ok_or(VaultError::Overflow)?;
+
+    let instruction = close_short_order_instruction(
+        &ShortOrderAccounts {
+            perpetual_program: ctx.accounts.perpetual_program.key(),
+            strategy_authority: authority,
+            store: ctx.accounts.perpetual_store.key(),
+            market: ctx.accounts.strategy_v1_state.perpetual_market,
+            user: ctx.accounts.perpetual_user.key(),
+            order: ctx.accounts.perpetual_order.key(),
+            position: ctx.accounts.pending_short_order.position,
+            usdc_mint: ctx.accounts.usdc_mint.key(),
+            order_usdc_escrow: ctx.accounts.order_usdc_escrow.key(),
+            strategy_usdc_source: ctx.accounts.strategy_usdc_source.key(),
+        },
+        &ctx.accounts.pending_short_order.nonce,
+    )?;
+
+    let vault_key = ctx.accounts.vault_v1_state.key();
+    let authority_bump = [ctx.bumps.strategy_authority];
+
+    let authority_seeds: &[&[u8]] = &[STRATEGY_AUTHORITY_SEED, vault_key.as_ref(), &authority_bump];
+
+    invoke_signed(
+        &instruction,
+        &[
+            ctx.accounts.strategy_authority.to_account_info(),
+            ctx.accounts.perpetual_store.to_account_info(),
+            ctx.accounts.perpetual_store_wallet.to_account_info(),
+            ctx.accounts.perpetual_user.to_account_info(),
+            ctx.accounts.perpetual_order.to_account_info(),
+            ctx.accounts.usdc_mint.to_account_info(),
+            ctx.accounts.order_usdc_escrow.to_account_info(),
+            ctx.accounts.strategy_usdc_source.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.associated_token_program.to_account_info(),
+            ctx.accounts.perpetual_event_authority.to_account_info(),
+            ctx.accounts.perpetual_program.to_account_info(),
+        ],
+        &[authority_seeds],
+    )?;
+
+    // CPI success alone does not prove the external close completed.
+    require!(
+        ctx.accounts.perpetual_order.to_account_info().lamports() == 0
+            && ctx.accounts.order_usdc_escrow.to_account_info().lamports() == 0,
+        VaultError::OrderClosureIncomplete
+    );
+
+    ctx.accounts.strategy_usdc_source.reload()?;
+
+    // Permit unsolicited extra tokens, but require recovery of at least
+    // the collateral recorded by this vault.
+    require!(
+        ctx.accounts.strategy_usdc_source.amount >= expected_source,
+        VaultError::InvalidCancellationRefund
+    );
+
+    token::transfer_checked(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.strategy_usdc_source.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
+                to: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+                authority: ctx.accounts.strategy_authority.to_account_info(),
+            },
+            &[authority_seeds],
+        ),
+        collateral,
+        RECEIPT_DECIMALS,
+    )?;
+
+    ctx.accounts.vault_v1_usdc_account.reload()?;
+    ctx.accounts.strategy_usdc_source.reload()?;
+
+    require!(
+        ctx.accounts.vault_v1_usdc_account.amount == expected_custody
+            && ctx.accounts.strategy_usdc_source.amount >= source_before,
+        VaultError::InvalidCancellationRefund
+    );
+
+    // Anchor closes our pending record on successful instruction exit.
+    // Any failure above rolls back cancellation and all token transfers.
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/configure_strategy.rs =====
+
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    token_2022::Token2022,
+    token_interface::{Mint, TokenAccount},
+};
+
+use crate::{
+    constants::*,
+    error::VaultError,
+    state::{StrategyV1State, VaultV1State},
+};
+
+#[derive(Accounts)]
+pub struct ConfigureStrategyV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            vault_v1_state.usdc_mint.as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = admin @ VaultError::UnauthorizedStrategyAdmin,
+        constraint = vault_v1_state.usdc_mint.to_string()
+            == MAINNET_USDC_MINT
+            @ VaultError::InvalidStrategyDepositMint
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        constraint = gold_mint.key().to_string()
+            == PAXG_MINT_ADDRESS
+            @ VaultError::InvalidGoldMint,
+        constraint = gold_mint.decimals == GOLD_DECIMALS
+            @ VaultError::InvalidGoldDecimals,
+        mint::token_program = gold_token_program
+    )]
+    pub gold_mint: InterfaceAccount<'info, Mint>,
+
+    /// CHECK: The exact program address and executable flag are checked.
+    #[account(
+        constraint = perpetual_program.key().to_string()
+            == GMTRADE_PROGRAM_ADDRESS
+            @ VaultError::InvalidPerpetualProgram,
+        executable
+    )]
+    pub perpetual_program: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are checked here; discriminator in handler.
+    #[account(
+        constraint = perpetual_store.key().to_string()
+            == GMTRADE_STORE_ADDRESS
+            @ VaultError::InvalidPerpetualStore,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_store: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are checked here; market fields in handler.
+    #[account(
+        constraint = perpetual_market.key().to_string()
+            == GMTRADE_XAU_MARKET_ADDRESS
+            @ VaultError::InvalidPerpetualMarket,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_market: UncheckedAccount<'info>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + StrategyV1State::INIT_SPACE,
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump
+    )]
+    pub strategy_v1_state: Account<'info, StrategyV1State>,
+
+    #[account(
+        init,
+        payer = admin,
+        seeds = [
+            GOLD_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = gold_mint,
+        token::authority = vault_v1_state,
+        token::token_program = gold_token_program
+    )]
+    pub vault_v1_gold_account: InterfaceAccount<'info, TokenAccount>,
+
+    pub gold_token_program: Program<'info, Token2022>,
+    pub system_program: Program<'info, System>,
+}
+
+fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(VaultError::InvalidExternalAccountData)?;
+
+    let bytes: [u8; 32] = data
+        .get(offset..end)
+        .ok_or(VaultError::InvalidExternalAccountData)?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidExternalAccountData))?;
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+fn validate_external_accounts(ctx: &Context<ConfigureStrategyV1>) -> Result<()> {
+    {
+        let data = ctx.accounts.perpetual_store.try_borrow_data()?;
+
+        require!(
+            data.get(..8) == Some(GMTRADE_STORE_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+    }
+
+    let data = ctx.accounts.perpetual_market.try_borrow_data()?;
+
+    // Published version-zero Market header and metadata layout.
+    // This validates the fields used by configuration, not the full account.
+    require!(data.len() >= 248, VaultError::InvalidExternalAccountData);
+
+    require!(
+        data.get(..8) == Some(GMTRADE_MARKET_DISCRIMINATOR.as_slice()),
+        VaultError::InvalidExternalAccountData
+    );
+
+    require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+    let flags = data[10];
+    let enabled = flags & (1 << 0) != 0;
+    let closed = flags & (1 << 5) != 0;
+
+    require!(enabled && !closed, VaultError::PerpetualMarketUnavailable);
+
+    let index_identifier = read_pubkey(&data, 120)?;
+    let long_collateral = read_pubkey(&data, 152)?;
+    let short_collateral = read_pubkey(&data, 184)?;
+    let store = read_pubkey(&data, 216)?;
+
+    require!(
+        index_identifier.to_string() == GMTRADE_XAU_INDEX_ADDRESS,
+        VaultError::InvalidPerpetualIndex
+    );
+
+    require_keys_eq!(
+        store,
+        ctx.accounts.perpetual_store.key(),
+        VaultError::InvalidPerpetualStore
+    );
+
+    require_keys_eq!(
+        long_collateral,
+        ctx.accounts.vault_v1_state.usdc_mint,
+        VaultError::InvalidPerpetualCollateral
+    );
+
+    require_keys_eq!(
+        short_collateral,
+        ctx.accounts.vault_v1_state.usdc_mint,
+        VaultError::InvalidPerpetualCollateral
+    );
+
+    Ok(())
+}
+
+pub fn handle_configure_strategy(ctx: Context<ConfigureStrategyV1>) -> Result<()> {
+    validate_external_accounts(&ctx)?;
+
+    ctx.accounts.strategy_v1_state.set_inner(StrategyV1State {
+        vault: ctx.accounts.vault_v1_state.key(),
+        gold_mint: ctx.accounts.gold_mint.key(),
+        gold_custody: ctx.accounts.vault_v1_gold_account.key(),
+        gold_token_program: ctx.accounts.gold_token_program.key(),
+        perpetual_program: ctx.accounts.perpetual_program.key(),
+        perpetual_store: ctx.accounts.perpetual_store.key(),
+        perpetual_market: ctx.accounts.perpetual_market.key(),
+        configured_at_slot: Clock::get()?.slot,
+        execution_enabled: false,
+        bump: ctx.bumps.strategy_v1_state,
+    });
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/create_short_order.rs =====
+
+use anchor_lang::{
+    prelude::*,
+    solana_program::program::invoke_signed,
+    system_program::{self, Transfer},
+};
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token::{self, Mint, Token, TokenAccount, TransferChecked},
+};
+
+use crate::{
+    adapters::gmtrade::{create_short_order_instruction, ShortIncreaseParams, ShortOrderAccounts},
+    constants::*,
+    error::VaultError,
+    state::{PendingShortOrderV1, StrategyV1State, VaultV1State},
+};
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone)]
+pub struct CreateShortOrderParamsV1 {
+    pub collateral_amount: u64,
+    pub size_delta_value: u128,
+    pub acceptable_price: u128,
+    pub execution_lamports: u64,
+    pub funding_lamports: u64,
+}
+
+#[derive(Accounts)]
+#[instruction(nonce: [u8; 32])]
+pub struct CreateShortOrderV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = admin @ VaultError::UnauthorizedStrategyAdmin,
+        has_one = usdc_mint
+    )]
+    pub vault_v1_state: Box<Account<'info, VaultV1State>>,
+
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump = strategy_v1_state.bump,
+        constraint = strategy_v1_state.vault
+            == vault_v1_state.key()
+            @ VaultError::InvalidStrategyVault,
+        constraint = strategy_v1_state.execution_enabled
+            @ VaultError::StrategyExecutionDisabled,
+        has_one = perpetual_program
+            @ VaultError::InvalidPerpetualProgram,
+        has_one = perpetual_store
+            @ VaultError::InvalidPerpetualStore,
+        has_one = perpetual_market
+            @ VaultError::InvalidPerpetualMarket
+    )]
+    pub strategy_v1_state: Box<Account<'info, StrategyV1State>>,
+
+    #[account(
+        constraint = usdc_mint.key().to_string()
+            == MAINNET_USDC_MINT
+            @ VaultError::InvalidStrategyDepositMint,
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Box<Account<'info, Mint>>,
+
+    #[account(
+        mut,
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Box<Account<'info, TokenAccount>>,
+
+    #[account(
+        mut,
+        seeds = [
+            STRATEGY_AUTHORITY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        constraint = strategy_authority.to_account_info().data_is_empty()
+            @ VaultError::InvalidStrategyAuthority
+    )]
+    pub strategy_authority: SystemAccount<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = admin,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = strategy_authority
+    )]
+    pub strategy_usdc_source: Box<Account<'info, TokenAccount>>,
+
+    /// CHECK: Exact program address and executable status are checked.
+    #[account(
+        constraint = perpetual_program.key().to_string()
+            == GMTRADE_PROGRAM_ADDRESS
+            @ VaultError::InvalidPerpetualProgram,
+        executable
+    )]
+    pub perpetual_program: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are checked; discriminator in handler.
+    #[account(
+        constraint = perpetual_store.key().to_string()
+            == GMTRADE_STORE_ADDRESS
+            @ VaultError::InvalidPerpetualStore,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_store: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are checked; metadata in handler.
+    #[account(
+        mut,
+        constraint = perpetual_market.key().to_string()
+            == GMTRADE_XAU_MARKET_ADDRESS
+            @ VaultError::InvalidPerpetualMarket,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_market: UncheckedAccount<'info>,
+
+    /// CHECK: Owner and PDA are checked here.
+    /// GMTrade additionally validates user initialization and identity.
+    #[account(
+        mut,
+        owner = perpetual_program.key(),
+        seeds = [
+            GMTRADE_USER_SEED,
+            perpetual_store.key().as_ref(),
+            strategy_authority.key().as_ref()
+        ],
+        bump,
+        seeds::program = perpetual_program.key()
+    )]
+    pub perpetual_user: UncheckedAccount<'info>,
+
+    /// CHECK: Owner is checked here; PDA and identity in handler.
+    #[account(
+        mut,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_position: UncheckedAccount<'info>,
+
+    /// CHECK: The external order PDA is constrained.
+    /// GMTrade initializes it through CPI.
+    #[account(
+        mut,
+        seeds = [
+            GMTRADE_ORDER_SEED,
+            perpetual_store.key().as_ref(),
+            strategy_authority.key().as_ref(),
+            &nonce
+        ],
+        bump,
+        seeds::program = perpetual_program.key()
+    )]
+    pub perpetual_order: UncheckedAccount<'info>,
+
+    #[account(
+        init_if_needed,
+        payer = admin,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = perpetual_order
+    )]
+    pub order_usdc_escrow: Box<Account<'info, TokenAccount>>,
+
+    // Singleton per vault. Existing pending state blocks another submission.
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + PendingShortOrderV1::INIT_SPACE,
+        seeds = [
+            PENDING_SHORT_ORDER_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump
+    )]
+    pub pending_short_order: Account<'info, PendingShortOrderV1>,
+
+    /// CHECK: Exact event-authority PDA is checked.
+    #[account(
+        seeds = [GMTRADE_EVENT_AUTHORITY_SEED],
+        bump,
+        seeds::program = perpetual_program.key()
+    )]
+    pub perpetual_event_authority: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(VaultError::InvalidExternalAccountData)?;
+
+    let bytes: [u8; 32] = data
+        .get(offset..end)
+        .ok_or(VaultError::InvalidExternalAccountData)?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidExternalAccountData))?;
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+fn validate_market_and_position(ctx: &Context<CreateShortOrderV1>) -> Result<()> {
+    {
+        let data = ctx.accounts.perpetual_store.try_borrow_data()?;
+
+        require!(
+            data.get(..8) == Some(GMTRADE_STORE_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+    }
+
+    let market_token = {
+        let data = ctx.accounts.perpetual_market.try_borrow_data()?;
+
+        require!(data.len() >= 248, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data.get(..8) == Some(GMTRADE_MARKET_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+
+        require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data[10] & (1 << 0) != 0 && data[10] & (1 << 5) == 0,
+            VaultError::PerpetualMarketUnavailable
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 216)?,
+            ctx.accounts.perpetual_store.key(),
+            VaultError::InvalidPerpetualStore
+        );
+
+        require!(
+            read_pubkey(&data, 120)?.to_string() == GMTRADE_XAU_INDEX_ADDRESS,
+            VaultError::InvalidPerpetualIndex
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 152)?,
+            ctx.accounts.usdc_mint.key(),
+            VaultError::InvalidPerpetualCollateral
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 184)?,
+            ctx.accounts.usdc_mint.key(),
+            VaultError::InvalidPerpetualCollateral
+        );
+
+        read_pubkey(&data, 88)?
+    };
+
+    let store = ctx.accounts.perpetual_store.key();
+    let authority = ctx.accounts.strategy_authority.key();
+    let collateral = ctx.accounts.usdc_mint.key();
+    let kind = [GMTRADE_SHORT_POSITION_KIND];
+
+    let (expected_position, position_bump) = Pubkey::find_program_address(
+        &[
+            GMTRADE_POSITION_SEED,
+            store.as_ref(),
+            authority.as_ref(),
+            market_token.as_ref(),
+            collateral.as_ref(),
+            &kind,
+        ],
+        &ctx.accounts.perpetual_program.key(),
+    );
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_position.key(),
+        expected_position,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    let data = ctx.accounts.perpetual_position.try_borrow_data()?;
+
+    require!(data.len() >= 152, VaultError::InvalidExternalAccountData);
+
+    require!(
+        data.get(..8) == Some(GMTRADE_POSITION_DISCRIMINATOR.as_slice()),
+        VaultError::InvalidPerpetualPosition
+    );
+
+    require!(
+        data[8] == 0 && data[9] == position_bump && data[42] == GMTRADE_SHORT_POSITION_KIND,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    require_keys_eq!(
+        read_pubkey(&data, 10)?,
+        store,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    require_keys_eq!(
+        read_pubkey(&data, 56)?,
+        authority,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    require_keys_eq!(
+        read_pubkey(&data, 88)?,
+        market_token,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    require_keys_eq!(
+        read_pubkey(&data, 120)?,
+        collateral,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    Ok(())
+}
+
+pub fn handle_create_short_order(
+    ctx: Context<CreateShortOrderV1>,
+    nonce: [u8; 32],
+    params: CreateShortOrderParamsV1,
+) -> Result<()> {
+    require!(
+        params.collateral_amount > 0 && params.size_delta_value > 0 && params.acceptable_price > 0,
+        VaultError::InvalidShortOrderParameters
+    );
+
+    validate_market_and_position(&ctx)?;
+
+    require!(
+        ctx.accounts.vault_v1_usdc_account.amount >= params.collateral_amount,
+        VaultError::InsufficientStrategyCollateral
+    );
+
+    require!(
+        ctx.accounts.order_usdc_escrow.amount == 0,
+        VaultError::OrderEscrowNotEmpty
+    );
+
+    let custody_before = ctx.accounts.vault_v1_usdc_account.amount;
+    let source_before = ctx.accounts.strategy_usdc_source.amount;
+
+    let instruction = create_short_order_instruction(
+        &ShortOrderAccounts {
+            perpetual_program: ctx.accounts.perpetual_program.key(),
+            strategy_authority: ctx.accounts.strategy_authority.key(),
+            store: ctx.accounts.perpetual_store.key(),
+            market: ctx.accounts.perpetual_market.key(),
+            user: ctx.accounts.perpetual_user.key(),
+            order: ctx.accounts.perpetual_order.key(),
+            position: ctx.accounts.perpetual_position.key(),
+            usdc_mint: ctx.accounts.usdc_mint.key(),
+            order_usdc_escrow: ctx.accounts.order_usdc_escrow.key(),
+            strategy_usdc_source: ctx.accounts.strategy_usdc_source.key(),
+        },
+        &nonce,
+        &ShortIncreaseParams {
+            collateral_amount: params.collateral_amount,
+            size_delta_value: params.size_delta_value,
+            acceptable_price: params.acceptable_price,
+            execution_lamports: params.execution_lamports,
+        },
+    )?;
+
+    if params.funding_lamports > 0 {
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                Transfer {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.strategy_authority.to_account_info(),
+                },
+            ),
+            params.funding_lamports,
+        )?;
+    }
+
+    // First signer: vault state authority, controlling idle USDC custody.
+    let usdc_key = ctx.accounts.usdc_mint.key();
+    let vault_bump = [ctx.accounts.vault_v1_state.bump];
+
+    let vault_seeds: &[&[u8]] = &[VAULT_SEED, usdc_key.as_ref(), &vault_bump];
+
+    token::transfer_checked(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
+                to: ctx.accounts.strategy_usdc_source.to_account_info(),
+                authority: ctx.accounts.vault_v1_state.to_account_info(),
+            },
+            &[vault_seeds],
+        ),
+        params.collateral_amount,
+        RECEIPT_DECIMALS,
+    )?;
+
+    // Second signer: system-owned strategy authority, owning the
+    // GMTrade user, position, order, and collateral-source ATA.
+    let vault_key = ctx.accounts.vault_v1_state.key();
+    let authority_bump = [ctx.bumps.strategy_authority];
+
+    let authority_seeds: &[&[u8]] = &[STRATEGY_AUTHORITY_SEED, vault_key.as_ref(), &authority_bump];
+
+    invoke_signed(
+        &instruction,
+        &[
+            ctx.accounts.strategy_authority.to_account_info(),
+            ctx.accounts.perpetual_store.to_account_info(),
+            ctx.accounts.perpetual_market.to_account_info(),
+            ctx.accounts.perpetual_user.to_account_info(),
+            ctx.accounts.perpetual_order.to_account_info(),
+            ctx.accounts.perpetual_position.to_account_info(),
+            ctx.accounts.usdc_mint.to_account_info(),
+            ctx.accounts.order_usdc_escrow.to_account_info(),
+            ctx.accounts.strategy_usdc_source.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+            ctx.accounts.token_program.to_account_info(),
+            ctx.accounts.associated_token_program.to_account_info(),
+            ctx.accounts.perpetual_event_authority.to_account_info(),
+            ctx.accounts.perpetual_program.to_account_info(),
+        ],
+        &[authority_seeds],
+    )?;
+
+    {
+        let order_info = ctx.accounts.perpetual_order.to_account_info();
+
+        require_keys_eq!(
+            *order_info.owner,
+            ctx.accounts.perpetual_program.key(),
+            VaultError::InvalidPerpetualOrderAccounts
+        );
+
+        let data = order_info.try_borrow_data()?;
+
+        require!(
+            data.get(..8) == Some(GMTRADE_ORDER_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidPerpetualOrderAccounts
+        );
+    }
+
+    ctx.accounts.vault_v1_usdc_account.reload()?;
+    ctx.accounts.strategy_usdc_source.reload()?;
+    ctx.accounts.order_usdc_escrow.reload()?;
+
+    let expected_custody = custody_before
+        .checked_sub(params.collateral_amount)
+        .ok_or(VaultError::InvalidOrderCollateralAccounting)?;
+
+    require!(
+        ctx.accounts.vault_v1_usdc_account.amount == expected_custody
+            && ctx.accounts.strategy_usdc_source.amount == source_before
+            && ctx.accounts.order_usdc_escrow.amount == params.collateral_amount,
+        VaultError::InvalidOrderCollateralAccounting
+    );
+
+    ctx.accounts
+        .pending_short_order
+        .set_inner(PendingShortOrderV1 {
+            vault: vault_key,
+            order: ctx.accounts.perpetual_order.key(),
+            position: ctx.accounts.perpetual_position.key(),
+            strategy_authority: ctx.accounts.strategy_authority.key(),
+            nonce,
+            collateral_amount: params.collateral_amount,
+            size_delta_value: params.size_delta_value,
+            acceptable_price: params.acceptable_price,
+            execution_lamports: params.execution_lamports,
+            submitted_at_slot: Clock::get()?.slot,
+            bump: ctx.bumps.pending_short_order,
+        });
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/deposit.rs =====
+
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token::{self, Mint, MintTo, Token, TokenAccount, TransferChecked},
+};
+
+use crate::{constants::*, error::VaultError, state::VaultV1State};
+
+#[derive(Accounts)]
+pub struct DepositUsdcV1<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        mut,
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = usdc_mint,
+        has_one = vxau_mint
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            VXAU_MINT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        mint::decimals = RECEIPT_DECIMALS,
+        mint::authority = vault_v1_state
+    )]
+    pub vxau_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = user
+    )]
+    pub user_usdc_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = vxau_mint,
+        associated_token::authority = user
+    )]
+    pub user_vxau_ata: Account<'info, TokenAccount>,
+
+    /// CHECK: Canonical strategy PDA is constrained.
+    /// The handler requires strategy configuration to be absent.
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump
+    )]
+    pub strategy_account: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn handle_deposit(ctx: Context<DepositUsdcV1>, amount: u64, min_shares_out: u64) -> Result<()> {
+    require!(amount > 0, VaultError::ZeroAmount);
+    require!(min_shares_out > 0, VaultError::InvalidMinimumOutput);
+
+    crate::instructions::read_idle_nav::require_idle_strategy(
+        &ctx.accounts.strategy_account.to_account_info(),
+    )?;
+
+    let next_total = ctx
+        .accounts
+        .vault_v1_state
+        .total_deposited
+        .checked_add(amount)
+        .ok_or(VaultError::Overflow)?;
+
+    // Read NAV and outstanding supply BEFORE the deposit.
+    let shares_out = crate::share_math::shares_for_deposit(
+        amount,
+        ctx.accounts.vxau_mint.supply,
+        ctx.accounts.vault_v1_usdc_account.amount,
+    )?;
+
+    require!(
+        shares_out >= min_shares_out,
+        VaultError::MinimumOutputNotMet
+    );
+
+    token::transfer_checked(
+        CpiContext::new(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.user_usdc_ata.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
+                to: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        amount,
+        RECEIPT_DECIMALS,
+    )?;
+
+    let usdc_mint_key = ctx.accounts.usdc_mint.key();
+    let bump = [ctx.accounts.vault_v1_state.bump];
+
+    let vault_seeds: &[&[u8]] = &[VAULT_SEED, usdc_mint_key.as_ref(), &bump];
+
+    token::mint_to(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            MintTo {
+                mint: ctx.accounts.vxau_mint.to_account_info(),
+                to: ctx.accounts.user_vxau_ata.to_account_info(),
+                authority: ctx.accounts.vault_v1_state.to_account_info(),
+            },
+            &[vault_seeds],
+        ),
+        shares_out,
+    )?;
+
+    ctx.accounts.vault_v1_state.total_deposited = next_total;
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/initialize.rs =====
+
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, Token, TokenAccount};
+
+use crate::{constants::*, error::VaultError, state::VaultV1State};
+
+#[derive(Accounts)]
+pub struct InitializeVaultV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        constraint = program.programdata_address()?
+            == Some(program_data.key())
+            @ VaultError::Unauthorized
+    )]
+    pub program: Program<'info, crate::program::XauCarryVault>,
+
+    #[account(
+        constraint = program_data.upgrade_authority_address
+            == Some(admin.key())
+            @ VaultError::Unauthorized
+    )]
+    pub program_data: Account<'info, ProgramData>,
+
+    #[account(
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Account<'info, Mint>,
+
+    #[account(
+        init,
+        payer = admin,
+        space = 8 + VaultV1State::INIT_SPACE,
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        init,
+        payer = admin,
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(
+        init,
+        payer = admin,
+        seeds = [
+            VXAU_MINT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        mint::decimals = RECEIPT_DECIMALS,
+        mint::authority = vault_v1_state
+    )]
+    pub vxau_mint: Account<'info, Mint>,
+
+    pub token_program: Program<'info, Token>,
+    pub system_program: Program<'info, System>,
+    pub rent: Sysvar<'info, Rent>,
+}
+
+pub fn handle_initialize(ctx: Context<InitializeVaultV1>) -> Result<()> {
+    ctx.accounts.vault_v1_state.set_inner(VaultV1State {
+        admin: ctx.accounts.admin.key(),
+        usdc_mint: ctx.accounts.usdc_mint.key(),
+        vxau_mint: ctx.accounts.vxau_mint.key(),
+        total_deposited: 0,
+        bump: ctx.bumps.vault_v1_state,
+    });
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/prepare_perpetual_user.rs =====
+
+use anchor_lang::{
+    prelude::*,
+    solana_program::{
+        instruction::{AccountMeta, Instruction},
+        program::invoke_signed,
+    },
+    system_program::{self, Transfer},
+};
+
+use crate::{
+    constants::*,
+    error::VaultError,
+    state::{StrategyV1State, VaultV1State},
+};
+
+#[derive(Accounts)]
+pub struct PreparePerpetualUserV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            vault_v1_state.usdc_mint.as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = admin @ VaultError::UnauthorizedStrategyAdmin
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump = strategy_v1_state.bump,
+        constraint = strategy_v1_state.vault
+            == vault_v1_state.key()
+            @ VaultError::InvalidStrategyVault,
+        has_one = perpetual_program
+            @ VaultError::InvalidPerpetualProgram,
+        has_one = perpetual_store
+            @ VaultError::InvalidPerpetualStore
+    )]
+    pub strategy_v1_state: Account<'info, StrategyV1State>,
+
+    // This PDA stays system-owned so it can pay rent during GMTrade CPIs.
+    // It requires no program-owned state account or private key.
+    #[account(
+        mut,
+        seeds = [
+            STRATEGY_AUTHORITY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        constraint = strategy_authority.to_account_info().data_is_empty()
+            @ VaultError::InvalidStrategyAuthority
+    )]
+    pub strategy_authority: SystemAccount<'info>,
+
+    /// CHECK: Pinned executable program, also linked through configuration.
+    #[account(
+        constraint = perpetual_program.key().to_string()
+            == GMTRADE_PROGRAM_ADDRESS
+            @ VaultError::InvalidPerpetualProgram,
+        executable
+    )]
+    pub perpetual_program: UncheckedAccount<'info>,
+
+    /// CHECK: Pinned address and owner; discriminator checked in handler.
+    #[account(
+        constraint = perpetual_store.key().to_string()
+            == GMTRADE_STORE_ADDRESS
+            @ VaultError::InvalidPerpetualStore,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_store: UncheckedAccount<'info>,
+
+    /// CHECK: GMTrade PDA seeds are checked here.
+    /// GMTrade initializes or validates the account through CPI.
+    /// Its owner and identity fields are checked again after CPI.
+    #[account(
+        mut,
+        seeds = [
+            GMTRADE_USER_SEED,
+            perpetual_store.key().as_ref(),
+            strategy_authority.key().as_ref()
+        ],
+        bump,
+        seeds::program = perpetual_program.key()
+    )]
+    pub perpetual_user: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(VaultError::InvalidExternalAccountData)?;
+
+    let bytes: [u8; 32] = data
+        .get(offset..end)
+        .ok_or(VaultError::InvalidExternalAccountData)?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidExternalAccountData))?;
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+pub fn handle_prepare_perpetual_user(
+    ctx: Context<PreparePerpetualUserV1>,
+    funding_lamports: u64,
+) -> Result<()> {
+    // Validate before funding or invoking the external program.
+    {
+        let data = ctx.accounts.perpetual_store.try_borrow_data()?;
+
+        require!(
+            data.get(..8) == Some(GMTRADE_STORE_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+    }
+
+    // Optional administrator-funded rent budget.
+    // A later call can use zero if the authority already has enough SOL.
+    if funding_lamports > 0 {
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                Transfer {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.strategy_authority.to_account_info(),
+                },
+            ),
+            funding_lamports,
+        )?;
+    }
+
+    let vault_key = ctx.accounts.vault_v1_state.key();
+    let authority_bump = [ctx.bumps.strategy_authority];
+
+    let authority_seeds: &[&[u8]] = &[STRATEGY_AUTHORITY_SEED, vault_key.as_ref(), &authority_bump];
+
+    // Published prepare_user ABI:
+    // owner: writable signer
+    // store: readonly
+    // user: writable
+    // system_program: readonly
+    // No instruction arguments.
+    let instruction = Instruction {
+        program_id: ctx.accounts.perpetual_program.key(),
+        accounts: vec![
+            AccountMeta::new(ctx.accounts.strategy_authority.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.perpetual_store.key(), false),
+            AccountMeta::new(ctx.accounts.perpetual_user.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+        ],
+        data: GMTRADE_PREPARE_USER_DISCRIMINATOR.to_vec(),
+    };
+
+    invoke_signed(
+        &instruction,
+        &[
+            ctx.accounts.strategy_authority.to_account_info(),
+            ctx.accounts.perpetual_store.to_account_info(),
+            ctx.accounts.perpetual_user.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+            ctx.accounts.perpetual_program.to_account_info(),
+        ],
+        &[authority_seeds],
+    )?;
+
+    // Validate the resulting account rather than treating CPI success
+    // alone as proof that our expected account identity was established.
+    let user_info = ctx.accounts.perpetual_user.to_account_info();
+
+    require_keys_eq!(
+        *user_info.owner,
+        ctx.accounts.perpetual_program.key(),
+        VaultError::InvalidPerpetualUser
+    );
+
+    {
+        let data = user_info.try_borrow_data()?;
+
+        // Published version-zero UserHeader prefix:
+        // discriminator: 0..8
+        // version, bump, flags, padding: 8..24
+        // owner: 24..56
+        // store: 56..88
+        require!(data.len() >= 88, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data.get(..8) == Some(GMTRADE_USER_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidPerpetualUser
+        );
+
+        require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data[9] == ctx.bumps.perpetual_user,
+            VaultError::InvalidPerpetualUser
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 24)?,
+            ctx.accounts.strategy_authority.key(),
+            VaultError::InvalidPerpetualUser
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 56)?,
+            ctx.accounts.perpetual_store.key(),
+            VaultError::InvalidPerpetualUser
+        );
+    }
+
+    msg!(
+        "Prepared GMTrade user {} for strategy authority {}",
+        ctx.accounts.perpetual_user.key(),
+        ctx.accounts.strategy_authority.key(),
+    );
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/prepare_short_position.rs =====
+
+use anchor_lang::{
+    prelude::*,
+    solana_program::{
+        instruction::{AccountMeta, Instruction},
+        program::invoke_signed,
+    },
+    system_program::{self, Transfer},
+};
+
+use crate::{
+    constants::*,
+    error::VaultError,
+    state::{StrategyV1State, VaultV1State},
+};
+
+#[derive(Accounts)]
+pub struct PrepareShortPositionV1<'info> {
+    #[account(mut)]
+    pub admin: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            vault_v1_state.usdc_mint.as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = admin @ VaultError::UnauthorizedStrategyAdmin
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump = strategy_v1_state.bump,
+        constraint = strategy_v1_state.vault
+            == vault_v1_state.key()
+            @ VaultError::InvalidStrategyVault,
+        has_one = perpetual_program
+            @ VaultError::InvalidPerpetualProgram,
+        has_one = perpetual_store
+            @ VaultError::InvalidPerpetualStore,
+        has_one = perpetual_market
+            @ VaultError::InvalidPerpetualMarket
+    )]
+    pub strategy_v1_state: Account<'info, StrategyV1State>,
+
+    #[account(
+        mut,
+        seeds = [
+            STRATEGY_AUTHORITY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        constraint = strategy_authority.to_account_info().data_is_empty()
+            @ VaultError::InvalidStrategyAuthority
+    )]
+    pub strategy_authority: SystemAccount<'info>,
+
+    /// CHECK: Exact program address and executable status are checked.
+    #[account(
+        constraint = perpetual_program.key().to_string()
+            == GMTRADE_PROGRAM_ADDRESS
+            @ VaultError::InvalidPerpetualProgram,
+        executable
+    )]
+    pub perpetual_program: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are constrained.
+    /// The handler also checks the discriminator.
+    #[account(
+        constraint = perpetual_store.key().to_string()
+            == GMTRADE_STORE_ADDRESS
+            @ VaultError::InvalidPerpetualStore,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_store: UncheckedAccount<'info>,
+
+    /// CHECK: Address and owner are constrained.
+    /// The handler checks market metadata and status flags.
+    #[account(
+        constraint = perpetual_market.key().to_string()
+            == GMTRADE_XAU_MARKET_ADDRESS
+            @ VaultError::InvalidPerpetualMarket,
+        owner = perpetual_program.key()
+    )]
+    pub perpetual_market: UncheckedAccount<'info>,
+
+    /// CHECK: The handler derives and checks the GMTrade position PDA.
+    /// GMTrade initializes or validates it through CPI.
+    /// Resulting ownership and identity are checked after CPI.
+    #[account(mut)]
+    pub perpetual_position: UncheckedAccount<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+fn read_pubkey(data: &[u8], offset: usize) -> Result<Pubkey> {
+    let end = offset
+        .checked_add(32)
+        .ok_or(VaultError::InvalidExternalAccountData)?;
+
+    let bytes: [u8; 32] = data
+        .get(offset..end)
+        .ok_or(VaultError::InvalidExternalAccountData)?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidExternalAccountData))?;
+
+    Ok(Pubkey::new_from_array(bytes))
+}
+
+// Encodes CreateOrderParams for position preparation only.
+// These zero-value parameters must not be reused for order creation.
+fn preparation_instruction_data() -> Vec<u8> {
+    let mut data = GMTRADE_PREPARE_POSITION_DISCRIMINATOR.to_vec();
+
+    // OrderKind::MarketIncrease.
+    data.push(3);
+
+    // decrease_position_swap_type: None.
+    data.push(0);
+
+    // execution_lamports.
+    data.extend_from_slice(&0u64.to_le_bytes());
+
+    // swap_path_length.
+    data.push(0);
+
+    // initial_collateral_delta_amount.
+    data.extend_from_slice(&0u64.to_le_bytes());
+
+    // size_delta_value.
+    data.extend_from_slice(&0u128.to_le_bytes());
+
+    // is_long: false.
+    data.push(0);
+
+    // is_collateral_long: false.
+    // Both collateral sides of the selected market are USDC.
+    data.push(0);
+
+    // min_output: None.
+    data.push(0);
+
+    // trigger_price: None.
+    data.push(0);
+
+    // acceptable_price: None.
+    data.push(0);
+
+    // should_unwrap_native_token: false.
+    data.push(0);
+
+    // valid_from_ts: None.
+    data.push(0);
+
+    data
+}
+
+pub fn handle_prepare_short_position(
+    ctx: Context<PrepareShortPositionV1>,
+    funding_lamports: u64,
+) -> Result<()> {
+    {
+        let data = ctx.accounts.perpetual_store.try_borrow_data()?;
+
+        require!(
+            data.get(..8) == Some(GMTRADE_STORE_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+    }
+
+    let market_token = {
+        let data = ctx.accounts.perpetual_market.try_borrow_data()?;
+
+        require!(data.len() >= 248, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data.get(..8) == Some(GMTRADE_MARKET_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidExternalAccountData
+        );
+
+        require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+        let flags = data[10];
+
+        require!(
+            flags & (1 << 0) != 0 && flags & (1 << 5) == 0,
+            VaultError::PerpetualMarketUnavailable
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 216)?,
+            ctx.accounts.perpetual_store.key(),
+            VaultError::InvalidPerpetualStore
+        );
+
+        require!(
+            read_pubkey(&data, 120)?.to_string() == GMTRADE_XAU_INDEX_ADDRESS,
+            VaultError::InvalidPerpetualIndex
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 152)?,
+            ctx.accounts.vault_v1_state.usdc_mint,
+            VaultError::InvalidPerpetualCollateral
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 184)?,
+            ctx.accounts.vault_v1_state.usdc_mint,
+            VaultError::InvalidPerpetualCollateral
+        );
+
+        read_pubkey(&data, 88)?
+    };
+
+    let store_key = ctx.accounts.perpetual_store.key();
+    let authority_key = ctx.accounts.strategy_authority.key();
+    let collateral_key = ctx.accounts.vault_v1_state.usdc_mint;
+    let program_key = ctx.accounts.perpetual_program.key();
+    let position_kind = [GMTRADE_SHORT_POSITION_KIND];
+
+    let (expected_position, position_bump) = Pubkey::find_program_address(
+        &[
+            GMTRADE_POSITION_SEED,
+            store_key.as_ref(),
+            authority_key.as_ref(),
+            market_token.as_ref(),
+            collateral_key.as_ref(),
+            &position_kind,
+        ],
+        &program_key,
+    );
+
+    require_keys_eq!(
+        ctx.accounts.perpetual_position.key(),
+        expected_position,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    // The administrator supplies SOL for external account rent.
+    if funding_lamports > 0 {
+        system_program::transfer(
+            CpiContext::new(
+                ctx.accounts.system_program.key(),
+                Transfer {
+                    from: ctx.accounts.admin.to_account_info(),
+                    to: ctx.accounts.strategy_authority.to_account_info(),
+                },
+            ),
+            funding_lamports,
+        )?;
+    }
+
+    let vault_key = ctx.accounts.vault_v1_state.key();
+    let authority_bump = [ctx.bumps.strategy_authority];
+
+    let authority_seeds: &[&[u8]] = &[STRATEGY_AUTHORITY_SEED, vault_key.as_ref(), &authority_bump];
+
+    let instruction = Instruction {
+        program_id: program_key,
+        accounts: vec![
+            AccountMeta::new(authority_key, true),
+            AccountMeta::new_readonly(store_key, false),
+            AccountMeta::new_readonly(ctx.accounts.perpetual_market.key(), false),
+            AccountMeta::new(expected_position, false),
+            AccountMeta::new_readonly(ctx.accounts.system_program.key(), false),
+        ],
+        data: preparation_instruction_data(),
+    };
+
+    invoke_signed(
+        &instruction,
+        &[
+            ctx.accounts.strategy_authority.to_account_info(),
+            ctx.accounts.perpetual_store.to_account_info(),
+            ctx.accounts.perpetual_market.to_account_info(),
+            ctx.accounts.perpetual_position.to_account_info(),
+            ctx.accounts.system_program.to_account_info(),
+            ctx.accounts.perpetual_program.to_account_info(),
+        ],
+        &[authority_seeds],
+    )?;
+
+    let position_info = ctx.accounts.perpetual_position.to_account_info();
+
+    require_keys_eq!(
+        *position_info.owner,
+        program_key,
+        VaultError::InvalidPerpetualPosition
+    );
+
+    {
+        let data = position_info.try_borrow_data()?;
+
+        // Published version-zero Position prefix:
+        // discriminator: 0..8
+        // version: 8
+        // bump: 9
+        // store: 10..42
+        // kind: 42
+        // padding: 43..48
+        // created_at: 48..56
+        // owner: 56..88
+        // market_token: 88..120
+        // collateral_token: 120..152
+        require!(data.len() >= 152, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data.get(..8) == Some(GMTRADE_POSITION_DISCRIMINATOR.as_slice()),
+            VaultError::InvalidPerpetualPosition
+        );
+
+        require!(data[8] == 0, VaultError::InvalidExternalAccountData);
+
+        require!(
+            data[9] == position_bump && data[42] == GMTRADE_SHORT_POSITION_KIND,
+            VaultError::InvalidPerpetualPosition
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 10)?,
+            store_key,
+            VaultError::InvalidPerpetualPosition
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 56)?,
+            authority_key,
+            VaultError::InvalidPerpetualPosition
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 88)?,
+            market_token,
+            VaultError::InvalidPerpetualPosition
+        );
+
+        require_keys_eq!(
+            read_pubkey(&data, 120)?,
+            collateral_key,
+            VaultError::InvalidPerpetualPosition
+        );
+    }
+
+    msg!("Prepared GMTrade XAU short position {}", expected_position);
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/read_idle_nav.rs =====
+
+use anchor_lang::prelude::*;
+use anchor_spl::token::{Mint, TokenAccount};
+
+use crate::{constants::*, error::VaultError, state::VaultV1State};
+
+#[derive(Accounts)]
+pub struct ReadIdleNavV1<'info> {
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = usdc_mint,
+        has_one = vxau_mint
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Account<'info, Mint>,
+
+    #[account(
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(
+        seeds = [
+            VXAU_MINT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        mint::decimals = RECEIPT_DECIMALS,
+        mint::authority = vault_v1_state
+    )]
+    pub vxau_mint: Account<'info, Mint>,
+
+    /// CHECK: The canonical strategy PDA is constrained here.
+    /// The handler requires an empty, system-owned account,
+    /// proving that strategy configuration has not been created.
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump
+    )]
+    pub strategy_account: UncheckedAccount<'info>,
+}
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Debug)]
+pub struct IdleNavQuoteV1 {
+    /// USDC base units currently held in canonical custody.
+    pub net_assets: u64,
+
+    /// Actual outstanding vXAU base units.
+    pub share_supply: u64,
+
+    /// Slot at which these accounts were read.
+    pub observed_slot: u64,
+}
+
+pub fn handle_read_idle_nav(ctx: Context<ReadIdleNavV1>) -> Result<IdleNavQuoteV1> {
+    require_idle_strategy(&ctx.accounts.strategy_account.to_account_info())?;
+
+    Ok(IdleNavQuoteV1 {
+        net_assets: ctx.accounts.vault_v1_usdc_account.amount,
+        share_supply: ctx.accounts.vxau_mint.supply,
+        observed_slot: Clock::get()?.slot,
+    })
+}
+
+pub fn require_idle_strategy(strategy_info: &AccountInfo<'_>) -> Result<()> {
+    require!(
+        *strategy_info.owner == anchor_lang::system_program::ID
+            && strategy_info.data_is_empty()
+            && !strategy_info.executable,
+        VaultError::FullStrategyNavRequired
+    );
+
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions/withdraw.rs =====
+
+use anchor_lang::prelude::*;
+use anchor_spl::{
+    associated_token::AssociatedToken,
+    token::{self, Burn, Mint, Token, TokenAccount, TransferChecked},
+};
+
+use crate::{constants::*, error::VaultError, state::VaultV1State};
+
+#[derive(Accounts)]
+pub struct WithdrawUsdcV1<'info> {
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    #[account(
+        seeds = [
+            VAULT_SEED,
+            usdc_mint.key().as_ref()
+        ],
+        bump = vault_v1_state.bump,
+        has_one = usdc_mint,
+        has_one = vxau_mint
+    )]
+    pub vault_v1_state: Account<'info, VaultV1State>,
+
+    #[account(
+        constraint = usdc_mint.decimals == RECEIPT_DECIMALS
+            @ VaultError::InvalidDecimals
+    )]
+    pub usdc_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        seeds = [
+            TOKEN_VAULT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        token::mint = usdc_mint,
+        token::authority = vault_v1_state
+    )]
+    pub vault_v1_usdc_account: Account<'info, TokenAccount>,
+
+    #[account(
+        mut,
+        seeds = [
+            VXAU_MINT_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump,
+        mint::decimals = RECEIPT_DECIMALS,
+        mint::authority = vault_v1_state
+    )]
+    pub vxau_mint: Account<'info, Mint>,
+
+    #[account(
+        mut,
+        associated_token::mint = vxau_mint,
+        associated_token::authority = user
+    )]
+    pub user_vxau_ata: Account<'info, TokenAccount>,
+
+    #[account(
+        init_if_needed,
+        payer = user,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = user
+    )]
+    pub user_usdc_ata: Account<'info, TokenAccount>,
+
+    /// CHECK: Canonical strategy PDA is constrained.
+    /// The handler requires strategy configuration to be absent.
+    #[account(
+        seeds = [
+            STRATEGY_SEED,
+            vault_v1_state.key().as_ref()
+        ],
+        bump
+    )]
+    pub strategy_account: UncheckedAccount<'info>,
+
+    pub token_program: Program<'info, Token>,
+    pub associated_token_program: Program<'info, AssociatedToken>,
+    pub system_program: Program<'info, System>,
+}
+
+pub fn handle_withdraw(
+    ctx: Context<WithdrawUsdcV1>,
+    amount: u64,
+    min_assets_out: u64,
+) -> Result<()> {
+    // amount is the number of vXAU base units to burn.
+    require!(amount > 0, VaultError::ZeroAmount);
+    require!(min_assets_out > 0, VaultError::InvalidMinimumOutput);
+
+    crate::instructions::read_idle_nav::require_idle_strategy(
+        &ctx.accounts.strategy_account.to_account_info(),
+    )?;
+
+    require!(
+        ctx.accounts.user_vxau_ata.amount >= amount,
+        VaultError::InsufficientReceipts
+    );
+
+    let assets_out = crate::share_math::assets_for_redemption(
+        amount,
+        ctx.accounts.vxau_mint.supply,
+        ctx.accounts.vault_v1_usdc_account.amount,
+    )?;
+
+    // Never burn shares for an output rounded down to zero.
+    require!(assets_out > 0, VaultError::RedemptionTooSmall);
+
+    require!(
+        assets_out >= min_assets_out,
+        VaultError::MinimumOutputNotMet
+    );
+
+    require!(
+        ctx.accounts.vault_v1_usdc_account.amount >= assets_out,
+        VaultError::InsufficientLiquidity
+    );
+
+    token::burn(
+        CpiContext::new(
+            ctx.accounts.token_program.key(),
+            Burn {
+                mint: ctx.accounts.vxau_mint.to_account_info(),
+                from: ctx.accounts.user_vxau_ata.to_account_info(),
+                authority: ctx.accounts.user.to_account_info(),
+            },
+        ),
+        amount,
+    )?;
+
+    let usdc_mint_key = ctx.accounts.usdc_mint.key();
+    let bump = [ctx.accounts.vault_v1_state.bump];
+
+    let vault_seeds: &[&[u8]] = &[VAULT_SEED, usdc_mint_key.as_ref(), &bump];
+
+    token::transfer_checked(
+        CpiContext::new_with_signer(
+            ctx.accounts.token_program.key(),
+            TransferChecked {
+                from: ctx.accounts.vault_v1_usdc_account.to_account_info(),
+                mint: ctx.accounts.usdc_mint.to_account_info(),
+                to: ctx.accounts.user_usdc_ata.to_account_info(),
+                authority: ctx.accounts.vault_v1_state.to_account_info(),
+            },
+            &[vault_seeds],
+        ),
+        assets_out,
+        RECEIPT_DECIMALS,
+    )?;
+
+    // Historical cumulative deposits remain unchanged.
+    Ok(())
+}
+
+
+===== programs/xau-carry-vault/src/instructions.rs =====
+
+pub mod cancel_short_order;
+pub mod configure_strategy;
+pub mod create_short_order;
+pub mod deposit;
+pub mod initialize;
+pub mod prepare_perpetual_user;
+pub mod prepare_short_position;
+pub mod read_idle_nav;
+pub mod withdraw;
+
+pub use cancel_short_order::*;
+pub use configure_strategy::*;
+pub use create_short_order::*;
+pub use deposit::*;
+pub use initialize::*;
+pub use prepare_perpetual_user::*;
+pub use prepare_short_position::*;
+pub use read_idle_nav::*;
+pub use withdraw::*;
+
+
+===== programs/xau-carry-vault/src/lib.rs =====
+
+pub mod adapters;
+pub mod constants;
+pub mod error;
+pub mod instructions;
+pub mod nav_math;
+pub mod oracle_math;
+pub mod pyth_reader;
+pub mod share_math;
+pub mod state;
+
+use anchor_lang::prelude::*;
+
+pub use instructions::*;
+pub use state::*;
+
+declare_id!("7UjnUp67WKZXAF3gRV4pZgaD6qsWE13gCu116VXsA5cb");
+
+#[program]
+pub mod xau_carry_vault {
+    use super::*;
+
+    pub fn initialize_vault_v1(ctx: Context<InitializeVaultV1>) -> Result<()> {
+        instructions::initialize::handle_initialize(ctx)
+    }
+
+    pub fn deposit_usdc_v1(
+        ctx: Context<DepositUsdcV1>,
+        amount: u64,
+        min_shares_out: u64,
+    ) -> Result<()> {
+        instructions::deposit::handle_deposit(ctx, amount, min_shares_out)
+    }
+
+    pub fn withdraw_usdc_v1(
+        ctx: Context<WithdrawUsdcV1>,
+        amount: u64,
+        min_assets_out: u64,
+    ) -> Result<()> {
+        instructions::withdraw::handle_withdraw(ctx, amount, min_assets_out)
+    }
+
+    pub fn configure_strategy_v1(ctx: Context<ConfigureStrategyV1>) -> Result<()> {
+        instructions::configure_strategy::handle_configure_strategy(ctx)
+    }
+
+    pub fn prepare_perpetual_user_v1(
+        ctx: Context<PreparePerpetualUserV1>,
+        funding_lamports: u64,
+    ) -> Result<()> {
+        instructions::prepare_perpetual_user::handle_prepare_perpetual_user(ctx, funding_lamports)
+    }
+
+    pub fn prepare_short_position_v1(
+        ctx: Context<PrepareShortPositionV1>,
+        funding_lamports: u64,
+    ) -> Result<()> {
+        instructions::prepare_short_position::handle_prepare_short_position(ctx, funding_lamports)
+    }
+
+    pub fn create_short_order_v1(
+        ctx: Context<CreateShortOrderV1>,
+        nonce: [u8; 32],
+        params: CreateShortOrderParamsV1,
+    ) -> Result<()> {
+        instructions::create_short_order::handle_create_short_order(ctx, nonce, params)
+    }
+
+    pub fn cancel_short_order_v1(ctx: Context<CancelShortOrderV1>) -> Result<()> {
+        instructions::cancel_short_order::handle_cancel_short_order(ctx)
+    }
+
+    pub fn read_idle_nav_v1(ctx: Context<ReadIdleNavV1>) -> Result<IdleNavQuoteV1> {
+        instructions::read_idle_nav::handle_read_idle_nav(ctx)
+    }
+}
+
+
+===== programs/xau-carry-vault/src/nav_math.rs =====
+
+use anchor_lang::prelude::*;
+
+use crate::error::VaultError;
+
+/// Six-decimal gold token and USDC accounting units.
+///
+/// A price of 3_000_000_000 represents 3,000 USDC per whole gold token.
+/// The oracle adapter must normalize its native price into this format.
+const UNIT: u128 = 1_000_000;
+const BPS: u128 = 10_000;
+
+/// Normalized oracle observation.
+///
+/// These fields are not independently authenticated by this module.
+/// An oracle adapter must validate the source account and feed identity.
+pub struct GoldPriceObservation {
+    pub price_usdc_per_token: u64,
+    pub confidence_usdc_per_token: u64,
+    pub published_at: i64,
+}
+
+/// Components must represent disjoint balances.
+///
+/// In particular:
+/// - pending collateral belongs in escrow, not position equity;
+/// - executed collateral belongs in position equity, not pending escrow;
+/// - USDC already counted in custody cannot also be strategy-held USDC.
+pub struct NavComponents {
+    pub custody_usdc: u64,
+    pub strategy_usdc: u64,
+    pub gold_value_usdc: u64,
+    pub pending_escrow_usdc: u64,
+
+    /// Position collateral + PnL + funding receivable
+    /// - borrowing fees - funding payable - other position liabilities.
+    ///
+    /// Negative equity must remain negative.
+    pub perpetual_equity_usdc: i128,
+
+    /// Liabilities outside the position-equity calculation.
+    /// Do not include fees already deducted from perpetual equity.
+    pub additional_liabilities_usdc: u64,
+}
+
+/// Conservative gold valuation using price minus confidence.
+///
+/// Gold amount and returned USDC value use six-decimal base units.
+/// This applies a lower confidence bound, not a liquidation quote.
+pub fn conservative_gold_value(
+    gold_amount: u64,
+    observation: &GoldPriceObservation,
+    now: i64,
+    max_age_seconds: u64,
+    max_confidence_bps: u16,
+) -> Result<u64> {
+    require!(
+        observation.price_usdc_per_token > 0 && max_age_seconds > 0 && max_confidence_bps < 10_000,
+        VaultError::InvalidGoldPrice
+    );
+
+    require!(
+        now >= 0 && observation.published_at >= 0 && observation.published_at <= now,
+        VaultError::InvalidGoldPriceTimestamp
+    );
+
+    let age = now
+        .checked_sub(observation.published_at)
+        .ok_or(VaultError::InvalidGoldPriceTimestamp)?;
+
+    require!(
+        age as u64 <= max_age_seconds,
+        VaultError::InvalidGoldPriceTimestamp
+    );
+
+    // Cross-multiply to avoid truncating the confidence ratio.
+    let confidence_scaled = u128::from(observation.confidence_usdc_per_token)
+        .checked_mul(BPS)
+        .ok_or(VaultError::Overflow)?;
+
+    let allowed_confidence = u128::from(observation.price_usdc_per_token)
+        .checked_mul(u128::from(max_confidence_bps))
+        .ok_or(VaultError::Overflow)?;
+
+    require!(
+        confidence_scaled <= allowed_confidence,
+        VaultError::GoldPriceTooUncertain
+    );
+
+    let conservative_price = observation
+        .price_usdc_per_token
+        .checked_sub(observation.confidence_usdc_per_token)
+        .ok_or(VaultError::InvalidGoldPrice)?;
+
+    require!(conservative_price > 0, VaultError::InvalidGoldPrice);
+
+    let value = u128::from(gold_amount)
+        .checked_mul(u128::from(conservative_price))
+        .ok_or(VaultError::Overflow)?
+        / UNIT;
+
+    u64::try_from(value).map_err(|_| error!(VaultError::Overflow))
+}
+
+/// Returns total net assets in USDC base units.
+///
+/// Zero NAV is returned as zero. Share pricing separately rejects
+/// deposits against zero NAV when outstanding shares exist.
+///
+/// Negative NAV is rejected. Negative position equity is never
+/// silently clamped to zero.
+pub fn calculate_nav(components: &NavComponents) -> Result<u64> {
+    let mut net = i128::from(components.custody_usdc);
+
+    for asset in [
+        components.strategy_usdc,
+        components.gold_value_usdc,
+        components.pending_escrow_usdc,
+    ] {
+        net = net
+            .checked_add(i128::from(asset))
+            .ok_or(VaultError::Overflow)?;
+    }
+
+    net = net
+        .checked_add(components.perpetual_equity_usdc)
+        .ok_or(VaultError::Overflow)?;
+
+    net = net
+        .checked_sub(i128::from(components.additional_liabilities_usdc))
+        .ok_or(VaultError::Overflow)?;
+
+    require!(net >= 0, VaultError::VaultInsolvent);
+
+    u64::try_from(net).map_err(|_| error!(VaultError::Overflow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const USDC: u64 = 1_000_000;
+
+    fn observation(price: u64, confidence: u64, published_at: i64) -> GoldPriceObservation {
+        GoldPriceObservation {
+            price_usdc_per_token: price,
+            confidence_usdc_per_token: confidence,
+            published_at,
+        }
+    }
+
+    fn components() -> NavComponents {
+        NavComponents {
+            custody_usdc: 100 * USDC,
+            strategy_usdc: 7 * USDC,
+            gold_value_usdc: 0,
+            pending_escrow_usdc: 0,
+            perpetual_equity_usdc: 0,
+            additional_liabilities_usdc: 0,
+        }
+    }
+
+    #[test]
+    fn gold_valuation_uses_lower_confidence_bound() {
+        // Half a gold token. Price 3,000 USDC, confidence 3 USDC.
+        let price = observation(3_000 * USDC, 3 * USDC, 1_000);
+
+        assert_eq!(
+            conservative_gold_value(500_000, &price, 1_010, 30, 100,).unwrap(),
+            1_498_500_000,
+        );
+    }
+
+    #[test]
+    fn gold_valuation_rounds_down() {
+        // One gold base unit, at 1.5 USDC per whole token.
+        let price = observation(1_500_000, 0, 1_000);
+
+        assert_eq!(
+            conservative_gold_value(1, &price, 1_000, 30, 100).unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn stale_future_and_uncertain_prices_are_rejected() {
+        let fresh = observation(3_000 * USDC, 0, 1_000);
+
+        assert!(conservative_gold_value(USDC, &fresh, 1_031, 30, 100,).is_err());
+
+        assert!(conservative_gold_value(USDC, &fresh, 999, 30, 100,).is_err());
+
+        let uncertain = observation(3_000 * USDC, 31 * USDC, 1_000);
+
+        assert!(conservative_gold_value(USDC, &uncertain, 1_000, 30, 100,).is_err());
+
+        // Exactly the permitted age and confidence limits.
+        let boundary = observation(3_000 * USDC, 30 * USDC, 1_000);
+
+        assert!(conservative_gold_value(USDC, &boundary, 1_030, 30, 100,).is_ok());
+    }
+
+    #[test]
+    fn order_collateral_movement_preserves_nav() {
+        let idle = components();
+        let initial_nav = calculate_nav(&idle).unwrap();
+
+        let mut pending = components();
+        pending.custody_usdc -= 40 * USDC;
+        pending.pending_escrow_usdc = 40 * USDC;
+
+        assert_eq!(calculate_nav(&pending).unwrap(), initial_nav);
+
+        let mut executed = components();
+        executed.custody_usdc -= 40 * USDC;
+        executed.perpetual_equity_usdc = i128::from(40 * USDC);
+
+        assert_eq!(calculate_nav(&executed).unwrap(), initial_nav);
+    }
+
+    #[test]
+    fn position_losses_and_other_liabilities_reduce_nav() {
+        let mut values = components();
+
+        values.gold_value_usdc = 50 * USDC;
+        values.perpetual_equity_usdc = -i128::from(20 * USDC);
+        values.additional_liabilities_usdc = 3 * USDC;
+
+        assert_eq!(calculate_nav(&values).unwrap(), 134 * USDC,);
+    }
+
+    #[test]
+    fn zero_negative_and_overflowing_nav_are_distinguished() {
+        let mut values = components();
+
+        values.perpetual_equity_usdc = -i128::from(107 * USDC);
+        assert_eq!(calculate_nav(&values).unwrap(), 0);
+
+        values.perpetual_equity_usdc -= 1;
+        assert!(calculate_nav(&values).is_err());
+
+        values = components();
+        values.perpetual_equity_usdc = i128::MAX;
+        assert!(calculate_nav(&values).is_err());
+
+        values = components();
+        values.custody_usdc = u64::MAX;
+        assert!(calculate_nav(&values).is_err());
+    }
+}
+
+
+===== programs/xau-carry-vault/src/oracle_math.rs =====
+
+use anchor_lang::prelude::*;
+
+use crate::error::VaultError;
+
+const UNIT: u128 = 1_000_000;
+const BPS: u128 = 10_000;
+
+/// Native oracle price: price * 10^exponent USD per whole token.
+///
+/// This is a math input, not proof of an authenticated oracle.
+/// The account adapter must verify program ownership, account layout,
+/// verification level, and the expected feed ID before constructing it.
+#[derive(Clone, Copy, Debug)]
+pub struct UsdPrice {
+    pub price: i64,
+    pub confidence: u64,
+    pub exponent: i32,
+    pub published_at: i64,
+}
+
+/// Validated confidence bounds in six-decimal USD units.
+#[derive(Clone, Copy, Debug)]
+struct UsdBounds {
+    lower: u128,
+    upper: u128,
+}
+
+fn checked_pow10(exponent: u32) -> Result<u128> {
+    10_u128
+        .checked_pow(exponent)
+        .ok_or_else(|| error!(VaultError::Overflow))
+}
+
+/// Validate native values before normalization.
+///
+/// Confidence is checked in native units so rounding cannot hide
+/// an excessively uncertain price.
+fn validated_bounds(
+    observation: &UsdPrice,
+    now: i64,
+    max_age_seconds: u64,
+    max_confidence_bps: u16,
+) -> Result<UsdBounds> {
+    require!(
+        observation.price > 0 && max_age_seconds > 0 && max_confidence_bps < 10_000,
+        VaultError::InvalidGoldPrice
+    );
+
+    require!(
+        now >= 0 && observation.published_at >= 0 && observation.published_at <= now,
+        VaultError::InvalidGoldPriceTimestamp
+    );
+
+    let age = now
+        .checked_sub(observation.published_at)
+        .ok_or(VaultError::InvalidGoldPriceTimestamp)?;
+
+    require!(
+        age as u64 <= max_age_seconds,
+        VaultError::InvalidGoldPriceTimestamp
+    );
+
+    let price = observation.price as u128;
+    let confidence = u128::from(observation.confidence);
+
+    require!(
+        confidence.checked_mul(BPS).ok_or(VaultError::Overflow)?
+            <= price
+                .checked_mul(u128::from(max_confidence_bps))
+                .ok_or(VaultError::Overflow)?,
+        VaultError::GoldPriceTooUncertain
+    );
+
+    let native_lower = price
+        .checked_sub(confidence)
+        .ok_or(VaultError::InvalidGoldPrice)?;
+
+    let native_upper = price.checked_add(confidence).ok_or(VaultError::Overflow)?;
+
+    require!(native_lower > 0, VaultError::InvalidGoldPrice);
+
+    // Normalize USD prices to six decimals.
+    // Restrict supported exponents rather than silently losing precision.
+    let shift = observation
+        .exponent
+        .checked_add(6)
+        .ok_or(VaultError::InvalidGoldPrice)?;
+
+    require!((-18..=18).contains(&shift), VaultError::InvalidGoldPrice);
+
+    let (lower, upper) = if shift >= 0 {
+        let multiplier = checked_pow10(shift as u32)?;
+
+        (
+            native_lower
+                .checked_mul(multiplier)
+                .ok_or(VaultError::Overflow)?,
+            native_upper
+                .checked_mul(multiplier)
+                .ok_or(VaultError::Overflow)?,
+        )
+    } else {
+        let divisor = checked_pow10((-shift) as u32)?;
+
+        // Lower bound rounds down.
+        let lower = native_lower / divisor;
+
+        // Upper bound rounds up without adding divisor - 1.
+        let upper = (native_upper / divisor)
+            .checked_add(u128::from(native_upper % divisor != 0))
+            .ok_or(VaultError::Overflow)?;
+
+        (lower, upper)
+    };
+
+    require!(lower > 0, VaultError::InvalidGoldPrice);
+
+    Ok(UsdBounds { lower, upper })
+}
+
+/// Conservatively value six-decimal gold units in six-decimal USDC units.
+///
+/// gold value = gold amount * gold USD lower bound / USDC USD upper bound.
+///
+/// Both feeds must pass age and confidence checks.
+/// The returned value rounds down.
+///
+/// Apply this function directly to the gold balance. Do not subtract
+/// confidence again through conservative_gold_value().
+pub fn gold_value_in_usdc(
+    gold_amount: u64,
+    gold_usd: &UsdPrice,
+    usdc_usd: &UsdPrice,
+    now: i64,
+    max_age_seconds: u64,
+    gold_max_confidence_bps: u16,
+    usdc_max_confidence_bps: u16,
+) -> Result<u64> {
+    let gold = validated_bounds(gold_usd, now, max_age_seconds, gold_max_confidence_bps)?;
+
+    let usdc = validated_bounds(usdc_usd, now, max_age_seconds, usdc_max_confidence_bps)?;
+
+    let value = u128::from(gold_amount)
+        .checked_mul(gold.lower)
+        .ok_or(VaultError::Overflow)?
+        / usdc.upper;
+
+    u64::try_from(value).map_err(|_| error!(VaultError::Overflow))
+}
+
+/// Convert a six-decimal USD liability into six-decimal USDC units.
+///
+/// Liabilities use the USDC lower bound and round up.
+/// This prevents underestimating a USD liability when USDC falls.
+pub fn usd_liability_in_usdc(
+    liability_usd: u64,
+    usdc_usd: &UsdPrice,
+    now: i64,
+    max_age_seconds: u64,
+    usdc_max_confidence_bps: u16,
+) -> Result<u64> {
+    let usdc = validated_bounds(usdc_usd, now, max_age_seconds, usdc_max_confidence_bps)?;
+
+    let numerator = u128::from(liability_usd)
+        .checked_mul(UNIT)
+        .ok_or(VaultError::Overflow)?;
+
+    let value = (numerator / usdc.lower)
+        .checked_add(u128::from(numerator % usdc.lower != 0))
+        .ok_or(VaultError::Overflow)?;
+
+    u64::try_from(value).map_err(|_| error!(VaultError::Overflow))
+}
+
+/// Validate an observation without calculating an asset value.
+pub fn validate_usd_price(
+    observation: &UsdPrice,
+    now: i64,
+    max_age_seconds: u64,
+    max_confidence_bps: u16,
+) -> Result<()> {
+    validated_bounds(observation, now, max_age_seconds, max_confidence_bps)?;
+
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const NOW: i64 = 1_000;
+    const USDC: u64 = 1_000_000;
+
+    fn price(value: i64, confidence: u64, exponent: i32) -> UsdPrice {
+        UsdPrice {
+            price: value,
+            confidence,
+            exponent,
+            published_at: NOW,
+        }
+    }
+
+    fn value(gold: &UsdPrice, usdc: &UsdPrice) -> Result<u64> {
+        gold_value_in_usdc(USDC, gold, usdc, NOW, 30, 100, 100)
+    }
+
+    #[test]
+    fn dollar_peg_preserves_gold_value() {
+        let gold = price(300_000_000_000, 0, -8);
+        let usdc = price(100_000_000, 0, -8);
+
+        assert_eq!(value(&gold, &usdc).unwrap(), 3_000 * USDC);
+    }
+
+    #[test]
+    fn usdc_depeg_changes_the_usdc_value() {
+        let gold = price(300_000_000_000, 0, -8);
+
+        let discounted_usdc = price(80_000_000, 0, -8);
+        assert_eq!(value(&gold, &discounted_usdc).unwrap(), 3_750 * USDC,);
+
+        let premium_usdc = price(120_000_000, 0, -8);
+        assert_eq!(value(&gold, &premium_usdc).unwrap(), 2_500 * USDC,);
+    }
+
+    #[test]
+    fn confidence_uses_lower_gold_and_upper_usdc() {
+        let gold = price(300_000_000_000, 300_000_000, -8);
+        let usdc = price(100_000_000, 100_000, -8);
+
+        // 2,997 USD / 1.001 USD per USDC, rounded down.
+        let expected = (2_997_u128 * 1_000_000 * 1_000_000 / 1_001_000) as u64;
+
+        assert_eq!(value(&gold, &usdc).unwrap(), expected);
+    }
+
+    #[test]
+    fn different_feed_exponents_are_supported() {
+        let gold = price(300_000, 0, -2);
+        let usdc = price(100_000_000, 0, -8);
+
+        assert_eq!(value(&gold, &usdc).unwrap(), 3_000 * USDC);
+
+        let gold_positive_exponent = price(3, 0, 3);
+        assert_eq!(value(&gold_positive_exponent, &usdc).unwrap(), 3_000 * USDC,);
+    }
+
+    #[test]
+    fn normalization_rounds_bounds_outward() {
+        let gold = price(150_000_099, 0, -8);
+        let usdc = price(100_000_001, 0, -8);
+
+        // Gold becomes 1_500_000; USDC upper becomes 1_000_001.
+        assert_eq!(value(&gold, &usdc).unwrap(), 1_499_998,);
+    }
+
+    #[test]
+    fn either_stale_or_future_feed_is_rejected() {
+        let gold = price(300_000_000_000, 0, -8);
+        let usdc = price(100_000_000, 0, -8);
+
+        let mut stale_gold = gold;
+        stale_gold.published_at = NOW - 31;
+        assert!(value(&stale_gold, &usdc).is_err());
+
+        let mut stale_usdc = usdc;
+        stale_usdc.published_at = NOW - 31;
+        assert!(value(&gold, &stale_usdc).is_err());
+
+        let mut future_usdc = usdc;
+        future_usdc.published_at = NOW + 1;
+        assert!(value(&gold, &future_usdc).is_err());
+
+        let mut boundary = usdc;
+        boundary.published_at = NOW - 30;
+        assert!(value(&gold, &boundary).is_ok());
+    }
+
+    #[test]
+    fn uncertain_and_nonpositive_prices_are_rejected() {
+        let gold = price(300_000_000_000, 0, -8);
+        let usdc = price(100_000_000, 0, -8);
+
+        let uncertain_gold = price(300_000_000_000, 3_000_000_001, -8);
+        assert!(value(&uncertain_gold, &usdc).is_err());
+
+        let uncertain_usdc = price(100_000_000, 1_000_001, -8);
+        assert!(value(&gold, &uncertain_usdc).is_err());
+
+        assert!(value(&price(0, 0, -8), &usdc).is_err());
+        assert!(value(&gold, &price(-1, 0, -8)).is_err());
+        assert!(value(&gold, &price(1, 0, -24)).is_err());
+        assert!(value(&price(1, 0, i32::MAX), &usdc).is_err());
+    }
+
+    #[test]
+    fn liabilities_round_up_and_use_lower_usdc_bound() {
+        let discounted_usdc = price(80_000_000, 0, -8);
+
+        assert_eq!(
+            usd_liability_in_usdc(USDC, &discounted_usdc, NOW, 30, 100,).unwrap(),
+            1_250_000,
+        );
+
+        let premium_usdc = price(120_000_000, 0, -8);
+
+        assert_eq!(
+            usd_liability_in_usdc(1, &premium_usdc, NOW, 30, 100,).unwrap(),
+            1,
+        );
+    }
+
+    #[test]
+    fn zero_balance_still_requires_valid_prices() {
+        let gold = price(300_000_000_000, 0, -8);
+        let usdc = price(100_000_000, 0, -8);
+
+        assert_eq!(
+            gold_value_in_usdc(0, &gold, &usdc, NOW, 30, 100, 100,).unwrap(),
+            0,
+        );
+
+        let invalid_usdc = price(0, 0, -8);
+
+        assert!(gold_value_in_usdc(0, &gold, &invalid_usdc, NOW, 30, 100, 100,).is_err());
+    }
+
+    #[test]
+    fn oversized_output_is_rejected() {
+        let gold = price(300_000_000_000, 0, -8);
+        let usdc = price(100_000_000, 0, -8);
+
+        assert!(gold_value_in_usdc(u64::MAX, &gold, &usdc, NOW, 30, 100, 100,).is_err());
+    }
+}
+
+
+===== programs/xau-carry-vault/src/pyth_reader.rs =====
+
+use anchor_lang::prelude::*;
+use std::str::FromStr;
+
+use crate::{
+    error::VaultError,
+    oracle_math::{validate_usd_price, UsdPrice},
+};
+
+const RECEIVER_ADDRESS: &str = "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp";
+
+const DISCRIMINATOR: [u8; 8] = [34, 241, 35, 99, 157, 126, 244, 205];
+
+const ACCOUNT_LENGTH: usize = 134;
+const FULL_VERIFICATION: u8 = 1;
+
+/// Account offsets for a fully verified PriceUpdateV2.
+///
+/// Partial verification has a different serialized width.
+/// It is rejected before reading these offsets.
+const VERIFICATION_OFFSET: usize = 40;
+const FEED_OFFSET: usize = 41;
+const PRICE_OFFSET: usize = 73;
+const CONFIDENCE_OFFSET: usize = 81;
+const EXPONENT_OFFSET: usize = 89;
+const PUBLISH_TIME_OFFSET: usize = 93;
+const PREVIOUS_TIME_OFFSET: usize = 101;
+const POSTED_SLOT_OFFSET: usize = 125;
+
+fn receiver_id() -> Result<Pubkey> {
+    Pubkey::from_str(RECEIVER_ADDRESS).map_err(|_| error!(VaultError::InvalidOracleOwner))
+}
+
+fn bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
+    let end = offset
+        .checked_add(N)
+        .ok_or(VaultError::InvalidOracleAccount)?;
+
+    data.get(offset..end)
+        .ok_or_else(|| error!(VaultError::InvalidOracleAccount))?
+        .try_into()
+        .map_err(|_| error!(VaultError::InvalidOracleAccount))
+}
+
+/// Internal parser. Production callers must use read_price().
+fn parse_price(
+    owner: &Pubkey,
+    executable: bool,
+    data: &[u8],
+    expected_feed: &[u8; 32],
+    clock: &Clock,
+    max_age_seconds: u64,
+    max_confidence_bps: u16,
+) -> Result<UsdPrice> {
+    require_keys_eq!(*owner, receiver_id()?, VaultError::InvalidOracleOwner);
+
+    require!(
+        !executable && data.len() == ACCOUNT_LENGTH,
+        VaultError::InvalidOracleAccount
+    );
+
+    require!(
+        bytes::<8>(data, 0)? == DISCRIMINATOR,
+        VaultError::InvalidOracleAccount
+    );
+
+    require!(
+        data[VERIFICATION_OFFSET] == FULL_VERIFICATION,
+        VaultError::OracleNotFullyVerified
+    );
+
+    // The expected feed must come from trusted protocol configuration,
+    // never from a depositor-supplied instruction argument.
+    require!(
+        *expected_feed != [0; 32] && bytes::<32>(data, FEED_OFFSET)? == *expected_feed,
+        VaultError::InvalidOracleFeed
+    );
+
+    let posted_slot = u64::from_le_bytes(bytes::<8>(data, POSTED_SLOT_OFFSET)?);
+
+    require!(posted_slot <= clock.slot, VaultError::InvalidOracleSlot);
+
+    let observation = UsdPrice {
+        price: i64::from_le_bytes(bytes::<8>(data, PRICE_OFFSET)?),
+        confidence: u64::from_le_bytes(bytes::<8>(data, CONFIDENCE_OFFSET)?),
+        exponent: i32::from_le_bytes(bytes::<4>(data, EXPONENT_OFFSET)?),
+        published_at: i64::from_le_bytes(bytes::<8>(data, PUBLISH_TIME_OFFSET)?),
+    };
+
+    let previous_time = i64::from_le_bytes(bytes::<8>(data, PREVIOUS_TIME_OFFSET)?);
+
+    require!(
+        previous_time <= observation.published_at,
+        VaultError::InvalidOracleAccount
+    );
+
+    validate_usd_price(
+        &observation,
+        clock.unix_timestamp,
+        max_age_seconds,
+        max_confidence_bps,
+    )?;
+
+    Ok(observation)
+}
+
+/// Read a fully verified Pyth Core USD price.
+///
+/// expected_feed and validation limits must come from protocol
+/// constants or a validated configuration PDA.
+///
+/// This reads the transaction's Clock sysvar. The client cannot
+/// supply a timestamp to bypass freshness checks.
+pub fn read_price(
+    account: &AccountInfo<'_>,
+    expected_feed: &[u8; 32],
+    max_age_seconds: u64,
+    max_confidence_bps: u16,
+) -> Result<UsdPrice> {
+    let clock = Clock::get()?;
+    let data = account.try_borrow_data()?;
+
+    parse_price(
+        account.owner,
+        account.executable,
+        &data,
+        expected_feed,
+        &clock,
+        max_age_seconds,
+        max_confidence_bps,
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Synthetic test ID, not the production PAXG feed ID.
+    const FEED: [u8; 32] = [7; 32];
+
+    fn clock() -> Clock {
+        Clock {
+            slot: 100,
+            unix_timestamp: 1_000,
+            ..Clock::default()
+        }
+    }
+
+    fn fixture() -> Vec<u8> {
+        let mut data = vec![0_u8; ACCOUNT_LENGTH];
+
+        data[..8].copy_from_slice(&DISCRIMINATOR);
+        data[VERIFICATION_OFFSET] = FULL_VERIFICATION;
+        data[FEED_OFFSET..FEED_OFFSET + 32].copy_from_slice(&FEED);
+
+        data[PRICE_OFFSET..PRICE_OFFSET + 8].copy_from_slice(&300_000_000_000_i64.to_le_bytes());
+
+        data[CONFIDENCE_OFFSET..CONFIDENCE_OFFSET + 8]
+            .copy_from_slice(&300_000_000_u64.to_le_bytes());
+
+        data[EXPONENT_OFFSET..EXPONENT_OFFSET + 4].copy_from_slice(&(-8_i32).to_le_bytes());
+
+        data[PUBLISH_TIME_OFFSET..PUBLISH_TIME_OFFSET + 8].copy_from_slice(&990_i64.to_le_bytes());
+
+        data[PREVIOUS_TIME_OFFSET..PREVIOUS_TIME_OFFSET + 8]
+            .copy_from_slice(&989_i64.to_le_bytes());
+
+        data[POSTED_SLOT_OFFSET..POSTED_SLOT_OFFSET + 8].copy_from_slice(&99_u64.to_le_bytes());
+
+        data
+    }
+
+    fn read(data: &[u8]) -> Result<UsdPrice> {
+        parse_price(
+            &receiver_id().unwrap(),
+            false,
+            data,
+            &FEED,
+            &clock(),
+            30,
+            100,
+        )
+    }
+
+    #[test]
+    fn fully_verified_price_is_decoded() {
+        let observation = read(&fixture()).unwrap();
+
+        assert_eq!(observation.price, 300_000_000_000);
+        assert_eq!(observation.confidence, 300_000_000);
+        assert_eq!(observation.exponent, -8);
+        assert_eq!(observation.published_at, 990);
+    }
+
+    #[test]
+    fn wrong_owner_and_executable_accounts_are_rejected() {
+        let data = fixture();
+
+        assert!(parse_price(
+            &Pubkey::new_unique(),
+            false,
+            &data,
+            &FEED,
+            &clock(),
+            30,
+            100,
+        )
+        .is_err());
+
+        assert!(parse_price(
+            &receiver_id().unwrap(),
+            true,
+            &data,
+            &FEED,
+            &clock(),
+            30,
+            100,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn malformed_layouts_are_rejected_without_panicking() {
+        let original = fixture();
+
+        for length in 0..ACCOUNT_LENGTH {
+            assert!(read(&original[..length]).is_err());
+        }
+
+        let mut bad_discriminator = original.clone();
+        bad_discriminator[0] ^= 1;
+        assert!(read(&bad_discriminator).is_err());
+
+        let mut oversized = original;
+        oversized.push(0);
+        assert!(read(&oversized).is_err());
+    }
+
+    #[test]
+    fn partial_and_unknown_verification_are_rejected() {
+        let mut data = fixture();
+
+        data[VERIFICATION_OFFSET] = 0;
+        assert!(read(&data).is_err());
+
+        data[VERIFICATION_OFFSET] = 2;
+        assert!(read(&data).is_err());
+    }
+
+    #[test]
+    fn different_feed_is_rejected() {
+        let mut data = fixture();
+        data[FEED_OFFSET] ^= 1;
+
+        assert!(read(&data).is_err());
+    }
+
+    #[test]
+    fn stale_future_and_uncertain_updates_are_rejected() {
+        let mut data = fixture();
+
+        data[PUBLISH_TIME_OFFSET..PUBLISH_TIME_OFFSET + 8].copy_from_slice(&969_i64.to_le_bytes());
+        data[PREVIOUS_TIME_OFFSET..PREVIOUS_TIME_OFFSET + 8]
+            .copy_from_slice(&968_i64.to_le_bytes());
+
+        assert!(read(&data).is_err());
+
+        data = fixture();
+        data[PUBLISH_TIME_OFFSET..PUBLISH_TIME_OFFSET + 8]
+            .copy_from_slice(&1_001_i64.to_le_bytes());
+
+        assert!(read(&data).is_err());
+
+        data = fixture();
+        data[CONFIDENCE_OFFSET..CONFIDENCE_OFFSET + 8]
+            .copy_from_slice(&3_000_000_001_u64.to_le_bytes());
+
+        assert!(read(&data).is_err());
+    }
+
+    #[test]
+    fn future_posted_slot_is_rejected() {
+        let mut data = fixture();
+
+        data[POSTED_SLOT_OFFSET..POSTED_SLOT_OFFSET + 8].copy_from_slice(&101_u64.to_le_bytes());
+
+        assert!(read(&data).is_err());
+    }
+}
+
+
+===== programs/xau-carry-vault/src/share_math.rs =====
+
+use anchor_lang::prelude::*;
+
+use crate::error::VaultError;
+
+/// Calculates shares for a deposit.
+///
+/// All amounts use six-decimal base units:
+/// - deposit_amount and net_assets_before: USDC units;
+/// - share_supply: vXAU units.
+///
+/// NAV must be measured BEFORE including the new deposit.
+/// Shares round down so a depositor cannot receive excess ownership.
+pub fn shares_for_deposit(
+    deposit_amount: u64,
+    share_supply: u64,
+    net_assets_before: u64,
+) -> Result<u64> {
+    require!(deposit_amount > 0, VaultError::ZeroAmount);
+
+    if share_supply == 0 {
+        require!(net_assets_before == 0, VaultError::InvalidShareBootstrap);
+
+        // Initial price: one USDC unit per share unit.
+        return Ok(deposit_amount);
+    }
+
+    require!(net_assets_before > 0, VaultError::VaultInsolvent);
+
+    let numerator = u128::from(deposit_amount)
+        .checked_mul(u128::from(share_supply))
+        .ok_or(VaultError::Overflow)?;
+
+    let shares = numerator / u128::from(net_assets_before);
+
+    let shares = u64::try_from(shares).map_err(|_| error!(VaultError::Overflow))?;
+
+    require!(shares > 0, VaultError::DepositTooSmall);
+
+    Ok(shares)
+}
+
+/// Calculates USDC value represented by shares being redeemed.
+///
+/// This calculates entitlement, not available withdrawal liquidity.
+/// A handler must separately validate liquidity and minimum output.
+///
+/// Assets round down. Redeeming the entire supply returns all net assets.
+pub fn assets_for_redemption(
+    shares_to_redeem: u64,
+    share_supply: u64,
+    net_assets_before: u64,
+) -> Result<u64> {
+    require!(shares_to_redeem > 0, VaultError::ZeroAmount);
+
+    require!(
+        shares_to_redeem <= share_supply,
+        VaultError::InsufficientReceipts
+    );
+
+    require!(net_assets_before > 0, VaultError::VaultInsolvent);
+
+    let numerator = u128::from(shares_to_redeem)
+        .checked_mul(u128::from(net_assets_before))
+        .ok_or(VaultError::Overflow)?;
+
+    let assets = numerator / u128::from(share_supply);
+
+    u64::try_from(assets).map_err(|_| error!(VaultError::Overflow))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const UNIT: u64 = 1_000_000;
+
+    #[test]
+    fn empty_vault_bootstraps_one_to_one() {
+        assert_eq!(shares_for_deposit(100 * UNIT, 0, 0).unwrap(), 100 * UNIT,);
+
+        assert!(shares_for_deposit(100 * UNIT, 0, UNIT).is_err());
+    }
+
+    #[test]
+    fn profit_changes_deposit_and_redemption_prices() {
+        // 100 shares now represent 120 USDC.
+        let supply = 100 * UNIT;
+        let assets = 120 * UNIT;
+
+        // A 12-USDC deposit receives 10 shares.
+        assert_eq!(
+            shares_for_deposit(12 * UNIT, supply, assets).unwrap(),
+            10 * UNIT,
+        );
+
+        // Redeeming 10 existing shares returns 12 USDC.
+        assert_eq!(
+            assets_for_redemption(10 * UNIT, supply, assets).unwrap(),
+            12 * UNIT,
+        );
+    }
+
+    #[test]
+    fn loss_changes_deposit_and_redemption_prices() {
+        // 100 shares now represent 80 USDC.
+        let supply = 100 * UNIT;
+        let assets = 80 * UNIT;
+
+        assert_eq!(
+            shares_for_deposit(8 * UNIT, supply, assets).unwrap(),
+            10 * UNIT,
+        );
+
+        assert_eq!(
+            assets_for_redemption(10 * UNIT, supply, assets).unwrap(),
+            8 * UNIT,
+        );
+    }
+
+    #[test]
+    fn rounding_cannot_profit_a_deposit_then_redemption() {
+        let supply = 7;
+        let assets = 11;
+        let deposit = 5;
+
+        let minted = shares_for_deposit(deposit, supply, assets).unwrap();
+
+        assert_eq!(minted, 3);
+
+        let redeemed = assets_for_redemption(minted, supply + minted, assets + deposit).unwrap();
+
+        assert_eq!(redeemed, 4);
+        assert!(redeemed <= deposit);
+    }
+
+    #[test]
+    fn final_redemption_returns_all_assets() {
+        assert_eq!(assets_for_redemption(7, 7, 11).unwrap(), 11,);
+    }
+
+    #[test]
+    fn invalid_and_insolvent_inputs_are_rejected() {
+        assert!(shares_for_deposit(0, 100, 100).is_err());
+        assert!(shares_for_deposit(1, 100, 0).is_err());
+
+        // Would round to zero shares.
+        assert!(shares_for_deposit(1, 1, 100).is_err());
+
+        assert!(assets_for_redemption(0, 100, 100).is_err());
+        assert!(assets_for_redemption(101, 100, 100).is_err());
+        assert!(assets_for_redemption(1, 100, 0).is_err());
+        assert!(assets_for_redemption(1, 0, 100).is_err());
+    }
+
+    #[test]
+    fn large_values_do_not_overflow_intermediate_math() {
+        assert_eq!(
+            shares_for_deposit(u64::MAX, u64::MAX, u64::MAX).unwrap(),
+            u64::MAX,
+        );
+
+        assert_eq!(
+            assets_for_redemption(u64::MAX, u64::MAX, u64::MAX).unwrap(),
+            u64::MAX,
+        );
+
+        // The calculated share count cannot fit in u64.
+        assert!(shares_for_deposit(u64::MAX, u64::MAX, 1).is_err());
+    }
+}
+
+
+===== programs/xau-carry-vault/src/state.rs =====
+
+use anchor_lang::prelude::*;
+
+#[account]
+#[derive(InitSpace)]
+pub struct VaultV1State {
+    pub admin: Pubkey,
+    pub usdc_mint: Pubkey,
+    pub vxau_mint: Pubkey,
+    pub total_deposited: u64,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct StrategyV1State {
+    pub vault: Pubkey,
+    pub gold_mint: Pubkey,
+    pub gold_custody: Pubkey,
+    pub gold_token_program: Pubkey,
+    pub perpetual_program: Pubkey,
+    pub perpetual_store: Pubkey,
+    pub perpetual_market: Pubkey,
+    pub configured_at_slot: u64,
+    pub execution_enabled: bool,
+    pub bump: u8,
+}
+
+#[account]
+#[derive(InitSpace)]
+pub struct PendingShortOrderV1 {
+    pub vault: Pubkey,
+    pub order: Pubkey,
+    pub position: Pubkey,
+    pub strategy_authority: Pubkey,
+    pub nonce: [u8; 32],
+    pub collateral_amount: u64,
+    pub size_delta_value: u128,
+    pub acceptable_price: u128,
+    pub execution_lamports: u64,
+    pub submitted_at_slot: u64,
+    pub bump: u8,
+}
+
+
+===== programs/xau-carry-vault/tests/test_gmtrade_prepare.rs =====
+
+use anchor_spl::token::spl_token;
+use solana_last_restart_slot::LastRestartSlot;
+use solana_program_option::COption;
+use solana_program_pack::Pack;
+use {
+    anchor_lang::{
+        prelude::Pubkey,
+        solana_program::{instruction::Instruction, system_program},
+        AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas,
+    },
+    base64::{engine::general_purpose::STANDARD, Engine},
+    litesvm::LiteSVM,
+    serde_json::Value,
+    solana_account::Account,
+    solana_keypair::Keypair,
+    solana_message::{Message, VersionedMessage},
+    solana_signer::Signer,
+    solana_transaction::versioned::VersionedTransaction,
+    std::{fs, path::PathBuf, str::FromStr},
+    xau_carry_vault::{
+        constants::*,
+        state::{StrategyV1State, VaultV1State},
+    },
+};
+
+fn key(address: &str) -> Pubkey {
+    Pubkey::from_str(address).unwrap()
+}
+
+fn fixture_directory() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/gmtrade")
+}
+
+fn load_snapshot(svm: &mut LiteSVM, filename: &str, expected: Pubkey) {
+    let path = fixture_directory().join(filename);
+
+    let text = fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("Cannot read {}: {error}", path.display()));
+
+    let json: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("Invalid {}: {error}", path.display()));
+
+    let address = key(json["pubkey"]
+        .as_str()
+        .expect("Snapshot must contain pubkey"));
+
+    assert_eq!(address, expected, "Wrong snapshot address");
+
+    let account = &json["account"];
+
+    assert_eq!(
+        account["data"][1].as_str(),
+        Some("base64"),
+        "Expected base64 account data",
+    );
+
+    let data: Vec<u8> = STANDARD
+        .decode(account["data"][0].as_str().expect("Missing account data"))
+        .unwrap();
+
+    let owner = key(account["owner"].as_str().expect("Missing account owner"));
+
+    assert_eq!(owner, key(GMTRADE_PROGRAM_ADDRESS));
+
+    svm.set_account(
+        address,
+        Account {
+            lamports: account["lamports"].as_u64().unwrap(),
+            data,
+            owner,
+            executable: account["executable"].as_bool().unwrap(),
+            rent_epoch: account["rentEpoch"].as_u64().unwrap(),
+        },
+    )
+    .unwrap();
+}
+
+fn insert_state<T: AccountSerialize>(svm: &mut LiteSVM, address: Pubkey, state: &T, space: usize) {
+    let mut serialized: Vec<u8> = Vec::new();
+    state.try_serialize(&mut serialized).unwrap();
+
+    assert!(serialized.len() <= space);
+    serialized.resize(space, 0);
+
+    svm.set_account(
+        address,
+        Account {
+            lamports: svm.minimum_balance_for_rent_exemption(space),
+            data: serialized,
+            owner: xau_carry_vault::id(),
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+}
+
+fn send(svm: &mut LiteSVM, admin: &Keypair, instruction: Instruction) {
+    let message = Message::new_with_blockhash(
+        &[instruction],
+        Some(&admin.pubkey()),
+        &svm.latest_blockhash(),
+    );
+
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[admin]).unwrap();
+
+    let result = svm.send_transaction(transaction);
+
+    if let Err(error) = result {
+        panic!("Preparation CPI failed:\n{error:#?}");
+    }
+
+    // Allows another transaction with otherwise identical instruction data.
+    svm.expire_blockhash();
+}
+
+fn read_key(data: &[u8], offset: usize) -> Pubkey {
+    Pubkey::new_from_array(data[offset..offset + 32].try_into().unwrap())
+}
+
+#[test]
+#[ignore = "Requires a captured GMTrade program, store, and market"]
+fn snapshot_prepare_cpis_create_and_reuse_accounts() {
+    let mut svm = LiteSVM::new();
+    // Match the restart slot recorded by this captured GMTrade store.
+    svm.set_sysvar(&LastRestartSlot {
+        last_restart_slot: 246_464_040,
+    });
+    let admin = Keypair::new();
+
+    let our_program = xau_carry_vault::id();
+    let external_program = key(GMTRADE_PROGRAM_ADDRESS);
+    let store = key(GMTRADE_STORE_ADDRESS);
+    let market = key(GMTRADE_XAU_MARKET_ADDRESS);
+    let usdc = key(MAINNET_USDC_MINT);
+
+    let our_binary =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../target/deploy/xau_carry_vault.so");
+
+    svm.add_program(
+        our_program,
+        &fs::read(&our_binary).expect("Run anchor build first"),
+    )
+    .unwrap();
+
+    svm.add_program(
+        external_program,
+        &fs::read(fixture_directory().join("gmtrade.so"))
+            .expect("Capture the GMTrade binary first"),
+    )
+    .unwrap();
+
+    load_snapshot(&mut svm, "store.json", store);
+    load_snapshot(&mut svm, "market.json", market);
+
+    svm.airdrop(&admin.pubkey(), 1_000_000_000).unwrap();
+
+    let (vault, vault_bump) =
+        Pubkey::find_program_address(&[VAULT_SEED, usdc.as_ref()], &our_program);
+
+    let (receipt_mint, _) =
+        Pubkey::find_program_address(&[VXAU_MINT_SEED, vault.as_ref()], &our_program);
+
+    let (strategy, strategy_bump) =
+        Pubkey::find_program_address(&[STRATEGY_SEED, vault.as_ref()], &our_program);
+
+    let (authority, _) =
+        Pubkey::find_program_address(&[STRATEGY_AUTHORITY_SEED, vault.as_ref()], &our_program);
+
+    let (gold_custody, _) =
+        Pubkey::find_program_address(&[GOLD_VAULT_SEED, vault.as_ref()], &our_program);
+
+    // Inject our state to isolate preparation CPI compatibility.
+    // Initialization/configuration are outside this test's scope.
+    insert_state(
+        &mut svm,
+        vault,
+        &VaultV1State {
+            admin: admin.pubkey(),
+            usdc_mint: usdc,
+            vxau_mint: receipt_mint,
+            total_deposited: 0,
+            bump: vault_bump,
+        },
+        8 + 32 * 3 + 8 + 1,
+    );
+
+    insert_state(
+        &mut svm,
+        strategy,
+        &StrategyV1State {
+            vault,
+            gold_mint: key(PAXG_MINT_ADDRESS),
+            gold_custody,
+            gold_token_program: anchor_spl::token_2022::ID,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_market: market,
+            configured_at_slot: 0,
+            execution_enabled: false,
+            bump: strategy_bump,
+        },
+        8 + 32 * 7 + 8 + 1 + 1,
+    );
+
+    // Rent funding only. No USDC or gold is deposited in this test.
+    svm.airdrop(&authority, 100_000_000).unwrap();
+
+    let (external_user, user_bump) = Pubkey::find_program_address(
+        &[GMTRADE_USER_SEED, store.as_ref(), authority.as_ref()],
+        &external_program,
+    );
+
+    let market_account = svm.get_account(&market).unwrap();
+    assert_eq!(
+        &market_account.data[..8],
+        GMTRADE_MARKET_DISCRIMINATOR.as_slice(),
+    );
+    let market_token = read_key(&market_account.data, 88);
+
+    let (position, position_bump) = Pubkey::find_program_address(
+        &[
+            GMTRADE_POSITION_SEED,
+            store.as_ref(),
+            authority.as_ref(),
+            market_token.as_ref(),
+            usdc.as_ref(),
+            &[GMTRADE_SHORT_POSITION_KIND],
+        ],
+        &external_program,
+    );
+
+    let prepare_user = Instruction {
+        program_id: our_program,
+        accounts: xau_carry_vault::accounts::PreparePerpetualUserV1 {
+            admin: admin.pubkey(),
+            vault_v1_state: vault,
+            strategy_v1_state: strategy,
+            strategy_authority: authority,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_user: external_user,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: xau_carry_vault::instruction::PreparePerpetualUserV1 {
+            funding_lamports: 0,
+        }
+        .data(),
+    };
+
+    let prepare_position = Instruction {
+        program_id: our_program,
+        accounts: xau_carry_vault::accounts::PrepareShortPositionV1 {
+            admin: admin.pubkey(),
+            vault_v1_state: vault,
+            strategy_v1_state: strategy,
+            strategy_authority: authority,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_market: market,
+            perpetual_position: position,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: xau_carry_vault::instruction::PrepareShortPositionV1 {
+            funding_lamports: 0,
+        }
+        .data(),
+    };
+
+    send(&mut svm, &admin, prepare_user.clone());
+
+    let user_account = svm.get_account(&external_user).unwrap();
+    assert_eq!(user_account.owner, external_program);
+    assert_eq!(
+        &user_account.data[..8],
+        GMTRADE_USER_DISCRIMINATOR.as_slice(),
+    );
+    assert_eq!(user_account.data[9], user_bump);
+    assert_eq!(read_key(&user_account.data, 24), authority);
+    assert_eq!(read_key(&user_account.data, 56), store);
+
+    send(&mut svm, &admin, prepare_position.clone());
+
+    let position_account = svm.get_account(&position).unwrap();
+    assert_eq!(position_account.owner, external_program);
+    assert_eq!(
+        &position_account.data[..8],
+        GMTRADE_POSITION_DISCRIMINATOR.as_slice(),
+    );
+    assert_eq!(position_account.data[9], position_bump);
+    assert_eq!(position_account.data[42], GMTRADE_SHORT_POSITION_KIND);
+    assert_eq!(read_key(&position_account.data, 10), store);
+    assert_eq!(read_key(&position_account.data, 56), authority);
+    assert_eq!(read_key(&position_account.data, 88), market_token);
+    assert_eq!(read_key(&position_account.data, 120), usdc);
+
+    let remaining_sol = svm.get_account(&authority).unwrap().lamports;
+    assert!(remaining_sol < 100_000_000, "Creation should spend rent");
+
+    // Existing accounts should validate without being reset or charged rent.
+    send(&mut svm, &admin, prepare_user);
+    send(&mut svm, &admin, prepare_position);
+
+    assert_eq!(
+        svm.get_account(&external_user).unwrap().data,
+        user_account.data,
+    );
+    assert_eq!(
+        svm.get_account(&position).unwrap().data,
+        position_account.data,
+    );
+    assert_eq!(svm.get_account(&authority).unwrap().lamports, remaining_sol,);
+
+    let authority_account = svm.get_account(&authority).unwrap();
+    assert_eq!(authority_account.owner, system_program::ID);
+    assert!(authority_account.data.is_empty());
+
+    exercise_order_creation(
+        &mut svm,
+        &admin,
+        vault,
+        strategy,
+        authority,
+        store,
+        market,
+        external_user,
+        position,
+    );
+}
+
+fn install_mock_usdc(
+    svm: &mut LiteSVM,
+    mint: Pubkey,
+    custody: Pubkey,
+    vault: Pubkey,
+    source: Pubkey,
+    authority: Pubkey,
+) {
+    let mut mint_data: Vec<u8> = vec![0u8; spl_token::state::Mint::LEN];
+
+    let mint_state = spl_token::state::Mint {
+        mint_authority: COption::None,
+        supply: 1_007_000_000,
+        decimals: 6,
+        is_initialized: true,
+        freeze_authority: COption::None,
+    };
+
+    spl_token::state::Mint::pack(mint_state, mint_data.as_mut_slice()).unwrap();
+
+    let mint_lamports = svm.minimum_balance_for_rent_exemption(mint_data.len());
+
+    svm.set_account(
+        mint,
+        Account {
+            lamports: mint_lamports,
+            data: mint_data,
+            owner: spl_token::ID,
+            executable: false,
+            rent_epoch: 0,
+        },
+    )
+    .unwrap();
+
+    for (address, token_authority, amount) in [
+        (custody, vault, 1_000_000_000u64),
+        (source, authority, 7_000_000u64),
+    ] {
+        let mut data: Vec<u8> = vec![0u8; spl_token::state::Account::LEN];
+
+        let token_state = spl_token::state::Account {
+            mint,
+            owner: token_authority,
+            amount,
+            delegate: COption::None,
+            state: spl_token::state::AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        spl_token::state::Account::pack(token_state, data.as_mut_slice()).unwrap();
+
+        let token_lamports = svm.minimum_balance_for_rent_exemption(data.len());
+
+        svm.set_account(
+            address,
+            Account {
+                lamports: token_lamports,
+                data,
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+    }
+}
+
+fn token_amount(svm: &LiteSVM, address: Pubkey) -> u64 {
+    let account = svm.get_account(&address).unwrap();
+
+    assert_eq!(account.owner, spl_token::ID);
+
+    let token_state = spl_token::state::Account::unpack(account.data.as_slice()).unwrap();
+
+    token_state.amount
+}
+
+fn expect_failure(svm: &mut LiteSVM, admin: &Keypair, instruction: Instruction) -> String {
+    let message = Message::new_with_blockhash(
+        &[instruction],
+        Some(&admin.pubkey()),
+        &svm.latest_blockhash(),
+    );
+
+    let transaction =
+        VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[admin]).unwrap();
+
+    let error = svm
+        .send_transaction(transaction)
+        .expect_err("Transaction unexpectedly succeeded");
+
+    svm.expire_blockhash();
+
+    format!("{error:#?}")
+}
+
+fn assert_uncreated(svm: &LiteSVM, address: Pubkey) {
+    if let Some(account) = svm.get_account(&address) {
+        assert_eq!(account.lamports, 0);
+        assert!(account.data.is_empty());
+    }
+}
+
+fn exercise_order_creation(
+    svm: &mut LiteSVM,
+    admin: &Keypair,
+    vault: Pubkey,
+    strategy: Pubkey,
+    authority: Pubkey,
+    store: Pubkey,
+    market: Pubkey,
+    external_user: Pubkey,
+    position: Pubkey,
+) {
+    use xau_carry_vault::{
+        adapters::gmtrade::order_address, instructions::CreateShortOrderParamsV1,
+        state::PendingShortOrderV1,
+    };
+
+    let our_program = xau_carry_vault::id();
+    let external_program = key(GMTRADE_PROGRAM_ADDRESS);
+    let usdc = key(MAINNET_USDC_MINT);
+
+    let (custody, _) =
+        Pubkey::find_program_address(&[TOKEN_VAULT_SEED, vault.as_ref()], &our_program);
+
+    let source = anchor_spl::associated_token::get_associated_token_address(&authority, &usdc);
+
+    install_mock_usdc(svm, usdc, custody, vault, source, authority);
+
+    let nonce = [41u8; 32];
+
+    let (order, _) = order_address(&external_program, &store, &authority, &nonce);
+
+    let escrow = anchor_spl::associated_token::get_associated_token_address(&order, &usdc);
+
+    let (pending, _) =
+        Pubkey::find_program_address(&[PENDING_SHORT_ORDER_SEED, vault.as_ref()], &our_program);
+
+    let (event_authority, _) =
+        Pubkey::find_program_address(&[GMTRADE_EVENT_AUTHORITY_SEED], &external_program);
+
+    // Synthetic order-creation inputs only.
+    // No oracle, position execution, or realistic pricing is tested.
+    let collateral_amount = 100_000_000u64;
+    let size_delta_value = 100_000_000_000_000_000_000_000u128;
+    let acceptable_price = 1u128;
+    let execution_lamports = 50_000_000u64;
+    let funding_lamports = 100_000_000u64;
+
+    let instruction = Instruction {
+        program_id: our_program,
+        accounts: xau_carry_vault::accounts::CreateShortOrderV1 {
+            admin: admin.pubkey(),
+            vault_v1_state: vault,
+            strategy_v1_state: strategy,
+            usdc_mint: usdc,
+            vault_v1_usdc_account: custody,
+            strategy_authority: authority,
+            strategy_usdc_source: source,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_market: market,
+            perpetual_user: external_user,
+            perpetual_position: position,
+            perpetual_order: order,
+            order_usdc_escrow: escrow,
+            pending_short_order: pending,
+            perpetual_event_authority: event_authority,
+            token_program: spl_token::ID,
+            associated_token_program: anchor_spl::associated_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: xau_carry_vault::instruction::CreateShortOrderV1 {
+            nonce,
+            params: CreateShortOrderParamsV1 {
+                collateral_amount,
+                size_delta_value,
+                acceptable_price,
+                execution_lamports,
+                funding_lamports,
+            },
+        }
+        .data(),
+    };
+
+    // 1. Real configuration remains disabled.
+    let error = expect_failure(svm, admin, instruction.clone());
+
+    assert!(error.contains("StrategyExecutionDisabled"), "{error}",);
+
+    assert_eq!(token_amount(svm, custody), 1_000_000_000);
+    assert_eq!(token_amount(svm, source), 7_000_000);
+    assert_uncreated(svm, order);
+    assert_uncreated(svm, escrow);
+    assert_uncreated(svm, pending);
+
+    // Enable only the injected local test account.
+    let strategy_account = svm.get_account(&strategy).unwrap();
+    let mut strategy_data = strategy_account.data.as_slice();
+
+    let mut strategy_state = StrategyV1State::try_deserialize(&mut strategy_data).unwrap();
+
+    strategy_state.execution_enabled = true;
+
+    insert_state(svm, strategy, &strategy_state, strategy_account.data.len());
+
+    // 2. Force GMTrade to reject its user account.
+    // Our handler does not inspect this initialized flag, so rejection
+    // should happen inside GMTrade after our collateral transfer.
+    let valid_user = svm.get_account(&external_user).unwrap();
+    let mut invalid_user = valid_user.clone();
+
+    invalid_user.data[10] = 0;
+
+    svm.set_account(external_user, invalid_user).unwrap();
+
+    let authority_sol_before = svm.get_account(&authority).unwrap().lamports;
+
+    let position_before = svm.get_account(&position).unwrap().data;
+
+    let market_before = svm.get_account(&market).unwrap().data;
+
+    let error = expect_failure(svm, admin, instruction.clone());
+
+    assert!(
+        error.contains("InvalidUserAccount"),
+        "Expected GMTrade user validation failure:\n{error}",
+    );
+
+    assert!(
+        error.contains("TransferChecked"),
+        "Expected collateral transfer before CPI rejection:\n{error}",
+    );
+
+    assert_eq!(token_amount(svm, custody), 1_000_000_000);
+    assert_eq!(token_amount(svm, source), 7_000_000);
+
+    assert_eq!(
+        svm.get_account(&authority).unwrap().lamports,
+        authority_sol_before,
+    );
+
+    assert_eq!(svm.get_account(&position).unwrap().data, position_before,);
+
+    assert_eq!(svm.get_account(&market).unwrap().data, market_before,);
+
+    assert_uncreated(svm, order);
+    assert_uncreated(svm, escrow);
+    assert_uncreated(svm, pending);
+
+    svm.set_account(external_user, valid_user).unwrap();
+
+    // 3. Create the real external order in the local VM.
+    send(svm, admin, instruction.clone());
+
+    assert_eq!(
+        token_amount(svm, custody),
+        1_000_000_000 - collateral_amount,
+    );
+
+    // Existing source tokens must remain untouched.
+    assert_eq!(token_amount(svm, source), 7_000_000);
+
+    assert_eq!(token_amount(svm, escrow), collateral_amount,);
+
+    let order_account = svm.get_account(&order).unwrap();
+
+    assert_eq!(order_account.owner, external_program);
+    assert_eq!(
+        &order_account.data[..8],
+        GMTRADE_ORDER_DISCRIMINATOR.as_slice(),
+    );
+
+    let pending_account = svm.get_account(&pending).unwrap();
+    assert_eq!(pending_account.owner, our_program);
+
+    let mut pending_data = pending_account.data.as_slice();
+
+    let record = PendingShortOrderV1::try_deserialize(&mut pending_data).unwrap();
+
+    assert_eq!(record.vault, vault);
+    assert_eq!(record.order, order);
+    assert_eq!(record.position, position);
+    assert_eq!(record.strategy_authority, authority);
+    assert_eq!(record.nonce, nonce);
+    assert_eq!(record.collateral_amount, collateral_amount);
+    assert_eq!(record.size_delta_value, size_delta_value);
+    assert_eq!(record.acceptable_price, acceptable_price);
+    assert_eq!(record.execution_lamports, execution_lamports);
+
+    // Order creation should not change the prepared position itself.
+    assert_eq!(svm.get_account(&position).unwrap().data, position_before,);
+
+    // 4. A second order with a fresh nonce must be blocked by
+    // the singleton pending-order account.
+    let second_nonce = [42u8; 32];
+
+    let (second_order, _) = order_address(&external_program, &store, &authority, &second_nonce);
+
+    let second_escrow =
+        anchor_spl::associated_token::get_associated_token_address(&second_order, &usdc);
+
+    let mut second_instruction = instruction;
+
+    for account in &mut second_instruction.accounts {
+        if account.pubkey == order {
+            account.pubkey = second_order;
+        } else if account.pubkey == escrow {
+            account.pubkey = second_escrow;
+        }
+    }
+
+    second_instruction.data = xau_carry_vault::instruction::CreateShortOrderV1 {
+        nonce: second_nonce,
+        params: CreateShortOrderParamsV1 {
+            collateral_amount,
+            size_delta_value,
+            acceptable_price,
+            execution_lamports,
+            funding_lamports,
+        },
+    }
+    .data();
+
+    let custody_before_second = token_amount(svm, custody);
+    let authority_before_second = svm.get_account(&authority).unwrap().lamports;
+
+    let error = expect_failure(svm, admin, second_instruction);
+
+    assert!(
+        error.contains("already in use"),
+        "Expected pending-account initialization rejection:\n{error}",
+    );
+
+    assert_eq!(token_amount(svm, custody), custody_before_second,);
+
+    assert_eq!(
+        svm.get_account(&authority).unwrap().lamports,
+        authority_before_second,
+    );
+
+    assert_eq!(
+        svm.get_account(&pending).unwrap().data,
+        pending_account.data,
+    );
+
+    assert_eq!(svm.get_account(&order).unwrap().data, order_account.data,);
+
+    assert_eq!(token_amount(svm, escrow), collateral_amount);
+    assert_uncreated(svm, second_order);
+    assert_uncreated(svm, second_escrow);
+
+    // Cancellation must remain available while strategy execution is disabled.
+    let strategy_account = svm.get_account(&strategy).unwrap();
+    let mut strategy_data = strategy_account.data.as_slice();
+
+    let mut strategy_state = StrategyV1State::try_deserialize(&mut strategy_data).unwrap();
+
+    strategy_state.execution_enabled = false;
+
+    insert_state(svm, strategy, &strategy_state, strategy_account.data.len());
+
+    let (store_wallet, _) =
+        xau_carry_vault::adapters::gmtrade::store_wallet_address(&external_program, &store);
+
+    // Synthetic system-owned store wallet for this local CPI test.
+    // The external program and store data remain the captured versions.
+    svm.airdrop(&store_wallet, 1_000_000_000).unwrap();
+
+    let cancel_instruction = Instruction {
+        program_id: our_program,
+        accounts: xau_carry_vault::accounts::CancelShortOrderV1 {
+            admin: admin.pubkey(),
+            vault_v1_state: vault,
+            strategy_v1_state: strategy,
+            pending_short_order: pending,
+            usdc_mint: usdc,
+            vault_v1_usdc_account: custody,
+            strategy_authority: authority,
+            strategy_usdc_source: source,
+            perpetual_program: external_program,
+            perpetual_store: store,
+            perpetual_store_wallet: store_wallet,
+            perpetual_user: external_user,
+            perpetual_order: order,
+            order_usdc_escrow: escrow,
+            perpetual_event_authority: event_authority,
+            token_program: spl_token::ID,
+            associated_token_program: anchor_spl::associated_token::ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: xau_carry_vault::instruction::CancelShortOrderV1 {}.data(),
+    };
+
+    // A completed order must not be treated as cancelled collateral.
+    let valid_order = svm.get_account(&order).unwrap();
+    let mut completed_order = valid_order.clone();
+    completed_order.data[9] = 1;
+
+    svm.set_account(order, completed_order).unwrap();
+
+    let error = expect_failure(svm, admin, cancel_instruction.clone());
+    assert!(error.contains("OrderNotPending"), "{error}");
+
+    assert_eq!(token_amount(svm, custody), 900_000_000);
+    assert_eq!(token_amount(svm, escrow), collateral_amount);
+    assert_eq!(
+        svm.get_account(&pending).unwrap().data,
+        pending_account.data,
+    );
+
+    svm.set_account(order, valid_order).unwrap();
+
+    // Cancel the actual pending external order and recover its collateral.
+    send(svm, admin, cancel_instruction);
+
+    assert_eq!(token_amount(svm, custody), 1_000_000_000);
+    assert_eq!(token_amount(svm, source), 7_000_000);
+
+    assert_uncreated(svm, order);
+    assert_uncreated(svm, escrow);
+    assert_uncreated(svm, pending);
+
+    assert_eq!(svm.get_account(&position).unwrap().data, position_before,);
+
+    println!("Order cancellation returned collateral and cleared pending state");
+}
+
+
+===== programs/xau-carry-vault/tests/test_initialize.rs =====
+
+use {
+    anchor_lang::{
+        prelude::Pubkey, solana_program::system_program, AccountDeserialize, AccountSerialize,
+        InstructionData, ToAccountMetas,
+    },
+    anchor_spl::{
+        associated_token::get_associated_token_address,
+        token::spl_token::{
+            self,
+            state::{Account as SplTokenAccount, AccountState, Mint as SplMint},
+        },
+    },
+    litesvm::LiteSVM,
+    solana_account::Account,
+    solana_keypair::Keypair,
+    solana_message::{Message, VersionedMessage},
+    solana_program_option::COption,
+    solana_program_pack::Pack,
+    solana_signer::Signer,
+    solana_transaction::versioned::VersionedTransaction,
+};
+
+const INITIAL_USDC: u64 = 100_000_000; // 100 USDC
+const DEPOSIT_AMOUNT: u64 = 10_000_000; // 10 USDC
+
+struct Fixture {
+    svm: LiteSVM,
+    admin: Keypair,
+    user: Keypair,
+    program_id: Pubkey,
+    program_data: Pubkey,
+    usdc_mint: Pubkey,
+    vault_state: Pubkey,
+    vault_usdc: Pubkey,
+    vxau_mint: Pubkey,
+    user_usdc: Pubkey,
+    user_vxau: Pubkey,
+}
+
+impl Fixture {
+    fn new(usdc_decimals: u8) -> Self {
+        let program_id = xau_carry_vault::id();
+        let admin = Keypair::new();
+        let user = Keypair::new();
+        let usdc_mint = Keypair::new().pubkey();
+
+        let mut svm = LiteSVM::new();
+
+        let program_path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../target/deploy/xau_carry_vault.so");
+
+        let program_bytes =
+            std::fs::read(&program_path).expect("Run anchor build before running these tests");
+
+        svm.add_program(program_id, &program_bytes)
+            .expect("Failed to load Vault 1");
+
+        svm.airdrop(&admin.pubkey(), 10_000_000_000).unwrap();
+        svm.airdrop(&user.pubkey(), 10_000_000_000).unwrap();
+
+        // LiteSVM loads this program under the upgradeable loader.
+        // Supply the admin authority required by our initializer.
+        let loader_id: Pubkey = "BPFLoaderUpgradeab1e11111111111111111111111"
+            .parse()
+            .unwrap();
+
+        let program_data = Pubkey::find_program_address(&[program_id.as_ref()], &loader_id).0;
+
+        let mut program_data_account = svm
+            .get_account(&program_data)
+            .expect("Upgradeable ProgramData account is missing");
+
+        // UpgradeableLoaderState::ProgramData metadata:
+        // variant: u32, slot: u64, authority option: u8,
+        // authority public key: 32 bytes.
+        assert!(program_data_account.data.len() >= 45);
+        assert_eq!(&program_data_account.data[..4], &3_u32.to_le_bytes(),);
+
+        program_data_account.data[12] = 1;
+        program_data_account.data[13..45].copy_from_slice(admin.pubkey().as_ref());
+
+        svm.set_account(program_data, program_data_account).unwrap();
+
+        let mint_state = SplMint {
+            mint_authority: COption::Some(admin.pubkey()),
+            supply: INITIAL_USDC,
+            decimals: usdc_decimals,
+            is_initialized: true,
+            freeze_authority: COption::None,
+        };
+
+        let mut mint_data = vec![0; SplMint::LEN];
+        SplMint::pack(mint_state, &mut mint_data).unwrap();
+
+        svm.set_account(
+            usdc_mint,
+            Account {
+                lamports: svm.minimum_balance_for_rent_exemption(mint_data.len()),
+                data: mint_data,
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        let vault_state =
+            Pubkey::find_program_address(&[b"vault_v1", usdc_mint.as_ref()], &program_id).0;
+
+        let vault_usdc =
+            Pubkey::find_program_address(&[b"token_vault", vault_state.as_ref()], &program_id).0;
+
+        let vxau_mint =
+            Pubkey::find_program_address(&[b"vxau_mint", vault_state.as_ref()], &program_id).0;
+
+        let user_usdc = get_associated_token_address(&user.pubkey(), &usdc_mint);
+
+        let user_vxau = get_associated_token_address(&user.pubkey(), &vxau_mint);
+
+        let token_state = SplTokenAccount {
+            mint: usdc_mint,
+            owner: user.pubkey(),
+            amount: INITIAL_USDC,
+            delegate: COption::None,
+            state: AccountState::Initialized,
+            is_native: COption::None,
+            delegated_amount: 0,
+            close_authority: COption::None,
+        };
+
+        let mut token_data = vec![0; SplTokenAccount::LEN];
+        SplTokenAccount::pack(token_state, &mut token_data).unwrap();
+
+        svm.set_account(
+            user_usdc,
+            Account {
+                lamports: svm.minimum_balance_for_rent_exemption(token_data.len()),
+                data: token_data,
+                owner: spl_token::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+        Self {
+            svm,
+            admin,
+            user,
+            program_id,
+            program_data,
+            usdc_mint,
+            vault_state,
+            vault_usdc,
+            vxau_mint,
+            user_usdc,
+            user_vxau,
+        }
+    }
+
+    fn initialize(&mut self, signer: &Keypair) -> Result<(), String> {
+        let instruction = anchor_lang::solana_program::instruction::Instruction {
+            program_id: self.program_id,
+            accounts: xau_carry_vault::accounts::InitializeVaultV1 {
+                admin: signer.pubkey(),
+                program: self.program_id,
+                program_data: self.program_data,
+                usdc_mint: self.usdc_mint,
+                vault_v1_state: self.vault_state,
+                vault_v1_usdc_account: self.vault_usdc,
+                vxau_mint: self.vxau_mint,
+                token_program: spl_token::ID,
+                system_program: system_program::ID,
+                rent: anchor_lang::prelude::rent::ID,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::InitializeVaultV1 {}.data(),
+        };
+
+        let message = Message::new_with_blockhash(
+            &[instruction],
+            Some(&signer.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[signer]).unwrap();
+
+        let result = self
+            .svm
+            .send_transaction(transaction)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"));
+
+        self.svm.expire_blockhash();
+        result
+    }
+
+    fn initialize_as_admin(&mut self) {
+        // Separate keypair value avoids borrowing self.admin
+        // while mutably borrowing the fixture.
+        let admin = Keypair::try_from(self.admin.to_bytes().as_slice()).unwrap();
+
+        self.initialize(&admin)
+            .expect("Vault initialization failed");
+    }
+
+    fn deposit_with_min(&mut self, amount: u64, min_shares_out: u64) -> Result<(), String> {
+        let instruction = anchor_lang::solana_program::instruction::Instruction {
+            program_id: self.program_id,
+            accounts: xau_carry_vault::accounts::DepositUsdcV1 {
+                user: self.user.pubkey(),
+                vault_v1_state: self.vault_state,
+                usdc_mint: self.usdc_mint,
+                vault_v1_usdc_account: self.vault_usdc,
+                vxau_mint: self.vxau_mint,
+                user_usdc_ata: self.user_usdc,
+                user_vxau_ata: self.user_vxau,
+                strategy_account: self.strategy_address(),
+                token_program: spl_token::ID,
+                associated_token_program: anchor_spl::associated_token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::DepositUsdcV1 {
+                amount,
+                min_shares_out,
+            }
+            .data(),
+        };
+
+        let message = Message::new_with_blockhash(
+            &[instruction],
+            Some(&self.user.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&self.user])
+                .unwrap();
+
+        let result = self
+            .svm
+            .send_transaction(transaction)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"));
+
+        self.svm.expire_blockhash();
+        result
+    }
+
+    fn state(&self) -> xau_carry_vault::state::VaultV1State {
+        let account = self.svm.get_account(&self.vault_state).unwrap();
+
+        let mut data: &[u8] = &account.data;
+
+        xau_carry_vault::state::VaultV1State::try_deserialize(&mut data).unwrap()
+    }
+
+    fn token(&self, address: Pubkey) -> SplTokenAccount {
+        let account = self.svm.get_account(&address).unwrap();
+        SplTokenAccount::unpack(&account.data).unwrap()
+    }
+
+    fn mint(&self, address: Pubkey) -> SplMint {
+        let account = self.svm.get_account(&address).unwrap();
+        SplMint::unpack(&account.data).unwrap()
+    }
+
+    fn assert_no_deposit(&self) {
+        assert_eq!(self.token(self.user_usdc).amount, INITIAL_USDC,);
+        assert_eq!(self.token(self.vault_usdc).amount, 0);
+        assert_eq!(self.state().total_deposited, 0);
+
+        // A failed deposit must also roll back ATA creation.
+        assert!(self
+            .svm
+            .get_account(&self.user_vxau)
+            .map_or(true, |account| account.lamports == 0));
+    }
+}
+
+#[test]
+fn initialize_sets_correct_state_and_authorities() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let state = fixture.state();
+
+    assert_eq!(state.admin, fixture.admin.pubkey());
+    assert_eq!(state.usdc_mint, fixture.usdc_mint);
+    assert_eq!(state.vxau_mint, fixture.vxau_mint);
+    assert_eq!(state.total_deposited, 0);
+
+    let state_account = fixture.svm.get_account(&fixture.vault_state).unwrap();
+
+    assert_eq!(state_account.owner, fixture.program_id);
+
+    let custody = fixture.token(fixture.vault_usdc);
+    assert_eq!(custody.mint, fixture.usdc_mint);
+    assert_eq!(custody.owner, fixture.vault_state);
+    assert_eq!(custody.amount, 0);
+
+    let mint = fixture.mint(fixture.vxau_mint);
+    assert_eq!(mint.decimals, 6);
+    assert_eq!(mint.supply, 0);
+    assert_eq!(mint.mint_authority, COption::Some(fixture.vault_state),);
+    assert_eq!(mint.freeze_authority, COption::None);
+
+    // SPL Token owns custody accounts and mints;
+    // the vault PDA controls their token authority.
+    assert_eq!(
+        fixture.svm.get_account(&fixture.vault_usdc).unwrap().owner,
+        spl_token::ID,
+    );
+}
+
+#[test]
+fn initialize_rejects_wrong_upgrade_authority() {
+    let mut fixture = Fixture::new(6);
+    let stranger = Keypair::new();
+
+    fixture
+        .svm
+        .airdrop(&stranger.pubkey(), 1_000_000_000)
+        .unwrap();
+
+    let error = fixture.initialize(&stranger).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6000)"),
+        "Expected Unauthorized; received: {error}",
+    );
+
+    assert!(fixture.svm.get_account(&fixture.vault_state).is_none());
+}
+
+#[test]
+fn initialize_rejects_wrong_usdc_decimals() {
+    let mut fixture = Fixture::new(9);
+
+    let admin = Keypair::try_from(fixture.admin.to_bytes().as_slice()).unwrap();
+
+    let error = fixture.initialize(&admin).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6001)"),
+        "Expected InvalidDecimals; received: {error}",
+    );
+
+    assert!(fixture.svm.get_account(&fixture.vault_state).is_none());
+}
+
+#[test]
+fn initialize_cannot_reset_existing_vault() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let admin = Keypair::try_from(fixture.admin.to_bytes().as_slice()).unwrap();
+
+    assert!(fixture.initialize(&admin).is_err());
+
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT,);
+}
+
+#[test]
+fn deposit_transfers_usdc_and_mints_receipts() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    assert_eq!(
+        fixture.token(fixture.user_usdc).amount,
+        INITIAL_USDC - DEPOSIT_AMOUNT,
+    );
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT,);
+
+    let receipts = fixture.token(fixture.user_vxau);
+    assert_eq!(receipts.owner, fixture.user.pubkey());
+    assert_eq!(receipts.mint, fixture.vxau_mint);
+}
+
+#[test]
+fn second_deposit_reuses_receipt_ata() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+    fixture.deposit(DEPOSIT_AMOUNT * 2).unwrap();
+
+    let total = DEPOSIT_AMOUNT * 3;
+
+    assert_eq!(
+        fixture.token(fixture.user_usdc).amount,
+        INITIAL_USDC - total,
+    );
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, total);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, total);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, total);
+    assert_eq!(fixture.state().total_deposited, total);
+}
+
+#[test]
+fn deposit_rejects_zero_amount() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let error = fixture.deposit(0).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6002)"),
+        "Expected ZeroAmount; received: {error}",
+    );
+
+    fixture.assert_no_deposit();
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+}
+
+#[test]
+fn deposit_rejects_insufficient_usdc() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    assert!(fixture.deposit(INITIAL_USDC + 1).is_err());
+
+    fixture.assert_no_deposit();
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+}
+
+#[test]
+fn failed_receipt_mint_rolls_back_usdc_transfer() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let mut account = fixture.svm.get_account(&fixture.user_vxau).unwrap();
+    let mut receipts = SplTokenAccount::unpack(&account.data).unwrap();
+
+    receipts.state = AccountState::Frozen;
+    SplTokenAccount::pack(receipts, &mut account.data).unwrap();
+
+    fixture.svm.set_account(fixture.user_vxau, account).unwrap();
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("Instruction: MintTo") && error.contains("frozen"),
+        "Expected receipt mint failure after transfer: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+    assert_eq!(fixture.token(fixture.user_vxau).state, AccountState::Frozen,);
+}
+
+#[test]
+fn deposit_rejects_substituted_custody_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_custody = fixture.vault_usdc;
+    let substituted_custody = Keypair::new().pubkey();
+
+    // Valid SPL account with the correct mint and authority,
+    // but the wrong address. This isolates the PDA seed check.
+    let custody_account = fixture.svm.get_account(&legitimate_custody).unwrap();
+
+    fixture
+        .svm
+        .set_account(substituted_custody, custody_account)
+        .unwrap();
+
+    fixture.vault_usdc = substituted_custody;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintSeeds"),
+        "Expected custody PDA rejection; received: {error}",
+    );
+
+    fixture.vault_usdc = legitimate_custody;
+
+    fixture.assert_no_deposit();
+    assert_eq!(fixture.token(substituted_custody).amount, 0,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0,);
+}
+
+#[test]
+fn deposit_rejects_unrelated_receipt_mint() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_mint = fixture.vxau_mint;
+    let legitimate_receipt_ata = fixture.user_vxau;
+    let substituted_mint = Keypair::new().pubkey();
+
+    // Correct decimals and authority, but not the mint
+    // recorded in VaultV1State.
+    let mint_account = fixture.svm.get_account(&legitimate_mint).unwrap();
+
+    fixture
+        .svm
+        .set_account(substituted_mint, mint_account)
+        .unwrap();
+
+    let substituted_receipt_ata =
+        get_associated_token_address(&fixture.user.pubkey(), &substituted_mint);
+
+    fixture.vxau_mint = substituted_mint;
+    fixture.user_vxau = substituted_receipt_ata;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintHasOne") || error.contains("ConstraintSeeds"),
+        "Expected receipt mint relationship rejection; received: {error}",
+    );
+
+    fixture.vxau_mint = legitimate_mint;
+    fixture.user_vxau = legitimate_receipt_ata;
+
+    fixture.assert_no_deposit();
+
+    assert_eq!(fixture.mint(legitimate_mint).supply, 0);
+    assert_eq!(fixture.mint(substituted_mint).supply, 0);
+
+    assert!(fixture
+        .svm
+        .get_account(&substituted_receipt_ata)
+        .map_or(true, |account| account.lamports == 0));
+}
+
+#[test]
+fn deposit_rejects_another_users_source_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let legitimate_source = fixture.user_usdc;
+    let other_user = Keypair::new();
+
+    let other_source = get_associated_token_address(&other_user.pubkey(), &fixture.usdc_mint);
+
+    let mut source_account = fixture.svm.get_account(&legitimate_source).unwrap();
+
+    let mut source = SplTokenAccount::unpack(&source_account.data).unwrap();
+
+    source.owner = other_user.pubkey();
+
+    SplTokenAccount::pack(source, &mut source_account.data).unwrap();
+
+    fixture
+        .svm
+        .set_account(other_source, source_account)
+        .unwrap();
+
+    fixture.user_usdc = other_source;
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintTokenOwner") || error.contains("ConstraintAssociated"),
+        "Expected source ownership/ATA rejection; received: {error}",
+    );
+
+    fixture.user_usdc = legitimate_source;
+
+    fixture.assert_no_deposit();
+
+    assert_eq!(fixture.token(other_source).amount, INITIAL_USDC,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0,);
+}
+
+#[test]
+fn deposit_rejects_cumulative_accounting_overflow() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    // Inject an extreme accounting value to exercise checked_add.
+    let mut state = fixture.state();
+    state.total_deposited = u64::MAX;
+
+    let mut state_account = fixture.svm.get_account(&fixture.vault_state).unwrap();
+
+    {
+        let mut destination: &mut [u8] = state_account.data.as_mut_slice();
+
+        state.try_serialize(&mut destination).unwrap();
+    }
+
+    fixture
+        .svm
+        .set_account(fixture.vault_state, state_account)
+        .unwrap();
+
+    let error = fixture.deposit(1).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6003)"),
+        "Expected Overflow; received: {error}",
+    );
+
+    assert_eq!(fixture.state().total_deposited, u64::MAX,);
+    assert_eq!(fixture.token(fixture.user_usdc).amount, INITIAL_USDC,);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 0);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+
+    assert!(fixture
+        .svm
+        .get_account(&fixture.user_vxau)
+        .map_or(true, |account| account.lamports == 0));
+}
+
+#[test]
+fn multiple_users_receive_correct_receipts() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    let first_source = fixture.user_usdc;
+    let first_receipt = fixture.user_vxau;
+
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let second_user = Keypair::new();
+
+    fixture
+        .svm
+        .airdrop(&second_user.pubkey(), 10_000_000_000)
+        .unwrap();
+
+    let second_source = get_associated_token_address(&second_user.pubkey(), &fixture.usdc_mint);
+
+    let second_receipt = get_associated_token_address(&second_user.pubkey(), &fixture.vxau_mint);
+
+    // Fund the second user's mock USDC account.
+    let mut source_account = fixture.svm.get_account(&first_source).unwrap();
+
+    let mut source = SplTokenAccount::unpack(&source_account.data).unwrap();
+
+    source.owner = second_user.pubkey();
+    source.amount = INITIAL_USDC;
+
+    SplTokenAccount::pack(source, &mut source_account.data).unwrap();
+
+    fixture
+        .svm
+        .set_account(second_source, source_account)
+        .unwrap();
+
+    // Keep the mock USDC mint supply consistent with funding.
+    let mut mint_account = fixture.svm.get_account(&fixture.usdc_mint).unwrap();
+
+    let mut mint = SplMint::unpack(&mint_account.data).unwrap();
+
+    mint.supply = mint.supply.checked_add(INITIAL_USDC).unwrap();
+
+    SplMint::pack(mint, &mut mint_account.data).unwrap();
+
+    fixture
+        .svm
+        .set_account(fixture.usdc_mint, mint_account)
+        .unwrap();
+
+    fixture.user = second_user;
+    fixture.user_usdc = second_source;
+    fixture.user_vxau = second_receipt;
+
+    let second_amount = DEPOSIT_AMOUNT * 2;
+
+    fixture.deposit(second_amount).unwrap();
+
+    let total = DEPOSIT_AMOUNT + second_amount;
+
+    assert_eq!(
+        fixture.token(first_source).amount,
+        INITIAL_USDC - DEPOSIT_AMOUNT,
+    );
+    assert_eq!(
+        fixture.token(second_source).amount,
+        INITIAL_USDC - second_amount,
+    );
+
+    assert_eq!(fixture.token(first_receipt).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.token(second_receipt).amount, second_amount,);
+
+    assert_eq!(fixture.token(second_receipt).owner, fixture.user.pubkey(),);
+
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, total);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, total);
+    assert_eq!(fixture.state().total_deposited, total);
+
+    assert_eq!(
+        fixture.token(first_receipt).amount + fixture.token(second_receipt).amount,
+        fixture.mint(fixture.vxau_mint).supply,
+    );
+}
+
+impl Fixture {
+    fn withdraw_with_min(&mut self, amount: u64, min_assets_out: u64) -> Result<(), String> {
+        let instruction = anchor_lang::solana_program::instruction::Instruction {
+            program_id: self.program_id,
+            accounts: xau_carry_vault::accounts::WithdrawUsdcV1 {
+                user: self.user.pubkey(),
+                vault_v1_state: self.vault_state,
+                usdc_mint: self.usdc_mint,
+                vault_v1_usdc_account: self.vault_usdc,
+                vxau_mint: self.vxau_mint,
+                user_vxau_ata: self.user_vxau,
+                user_usdc_ata: self.user_usdc,
+                strategy_account: self.strategy_address(),
+                token_program: spl_token::ID,
+                associated_token_program: anchor_spl::associated_token::ID,
+                system_program: system_program::ID,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::WithdrawUsdcV1 {
+                amount,
+                min_assets_out,
+            }
+            .data(),
+        };
+
+        let message = Message::new_with_blockhash(
+            &[instruction],
+            Some(&self.user.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&self.user])
+                .unwrap();
+
+        let result = self
+            .svm
+            .send_transaction(transaction)
+            .map(|_| ())
+            .map_err(|error| format!("{error:?}"));
+
+        self.svm.expire_blockhash();
+        result
+    }
+
+    fn assert_deposit_intact(&self, amount: u64) {
+        assert_eq!(self.token(self.user_usdc).amount, INITIAL_USDC - amount,);
+        assert_eq!(self.token(self.vault_usdc).amount, amount);
+        assert_eq!(self.token(self.user_vxau).amount, amount);
+        assert_eq!(self.mint(self.vxau_mint).supply, amount);
+        assert_eq!(self.state().total_deposited, amount);
+    }
+}
+
+#[test]
+fn withdraw_partial_burns_receipts_and_returns_usdc() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let redeemed = DEPOSIT_AMOUNT / 2;
+    fixture.withdraw(redeemed).unwrap();
+
+    let remaining = DEPOSIT_AMOUNT - redeemed;
+
+    assert_eq!(
+        fixture.token(fixture.user_usdc).amount,
+        INITIAL_USDC - remaining,
+    );
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, remaining);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, remaining);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, remaining);
+
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT,);
+}
+
+#[test]
+fn withdraw_full_then_deposit_again() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    fixture.withdraw(DEPOSIT_AMOUNT).unwrap();
+
+    assert_eq!(fixture.token(fixture.user_usdc).amount, INITIAL_USDC,);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 0);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, 0);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT,);
+
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT * 2,);
+}
+
+#[test]
+fn withdraw_rejects_zero_amount() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let error = fixture.withdraw(0).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6002)"),
+        "Expected ZeroAmount; received: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn withdraw_rejects_insufficient_receipts() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let error = fixture.withdraw(DEPOSIT_AMOUNT + 1).unwrap_err();
+
+    assert!(
+        error.contains("Custom(6004)"),
+        "Expected InsufficientReceipts; received: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn withdraw_prices_custody_loss_proportionally() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let remaining_assets = DEPOSIT_AMOUNT - 1;
+    fixture.set_custody_amount(remaining_assets);
+
+    // Redeeming all shares returns all remaining assets.
+    fixture
+        .withdraw_with_min(DEPOSIT_AMOUNT, remaining_assets)
+        .unwrap();
+
+    assert_eq!(fixture.token(fixture.user_usdc).amount, INITIAL_USDC - 1,);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 0);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, 0);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn failed_usdc_transfer_rolls_back_receipt_burn() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    // Simulate a frozen USDC destination. The receipt burn can
+    // succeed, but the subsequent transfer must fail.
+    let mut account = fixture.svm.get_account(&fixture.user_usdc).unwrap();
+
+    let mut destination = SplTokenAccount::unpack(&account.data).unwrap();
+
+    destination.state = AccountState::Frozen;
+
+    SplTokenAccount::pack(destination, &mut account.data).unwrap();
+
+    fixture.svm.set_account(fixture.user_usdc, account).unwrap();
+
+    assert!(fixture.withdraw(DEPOSIT_AMOUNT).is_err());
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+
+    assert_eq!(fixture.token(fixture.user_usdc).state, AccountState::Frozen,);
+}
+
+#[test]
+fn withdraw_rejects_substituted_custody_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let legitimate_custody = fixture.vault_usdc;
+    let substituted_custody = Keypair::new().pubkey();
+
+    let account = fixture.svm.get_account(&legitimate_custody).unwrap();
+
+    fixture
+        .svm
+        .set_account(substituted_custody, account)
+        .unwrap();
+
+    fixture.vault_usdc = substituted_custody;
+
+    let error = fixture.withdraw(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintSeeds"),
+        "Expected custody PDA rejection; received: {error}",
+    );
+
+    fixture.vault_usdc = legitimate_custody;
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+
+    assert_eq!(fixture.token(substituted_custody).amount, DEPOSIT_AMOUNT,);
+}
+
+#[test]
+fn withdraw_rejects_another_users_receipt_account() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let legitimate_receipt = fixture.user_vxau;
+    let other_user = Keypair::new();
+
+    let other_receipt = get_associated_token_address(&other_user.pubkey(), &fixture.vxau_mint);
+
+    let mut account = fixture.svm.get_account(&legitimate_receipt).unwrap();
+
+    let mut receipt = SplTokenAccount::unpack(&account.data).unwrap();
+
+    receipt.owner = other_user.pubkey();
+
+    SplTokenAccount::pack(receipt, &mut account.data).unwrap();
+
+    fixture.svm.set_account(other_receipt, account).unwrap();
+
+    fixture.user_vxau = other_receipt;
+
+    let error = fixture.withdraw(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintTokenOwner") || error.contains("ConstraintAssociated"),
+        "Expected receipt ownership rejection; received: {error}",
+    );
+
+    fixture.user_vxau = legitimate_receipt;
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+
+    assert_eq!(fixture.token(other_receipt).amount, DEPOSIT_AMOUNT,);
+}
+
+#[test]
+fn withdraw_rejects_another_users_usdc_destination() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let legitimate_destination = fixture.user_usdc;
+    let other_user = Keypair::new();
+
+    let other_destination = get_associated_token_address(&other_user.pubkey(), &fixture.usdc_mint);
+
+    let mut account = fixture.svm.get_account(&legitimate_destination).unwrap();
+
+    let mut destination = SplTokenAccount::unpack(&account.data).unwrap();
+
+    destination.owner = other_user.pubkey();
+    destination.amount = 0;
+
+    SplTokenAccount::pack(destination, &mut account.data).unwrap();
+
+    fixture.svm.set_account(other_destination, account).unwrap();
+
+    fixture.user_usdc = other_destination;
+
+    let error = fixture.withdraw(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintTokenOwner") || error.contains("ConstraintAssociated"),
+        "Expected destination ownership rejection; received: {error}",
+    );
+
+    fixture.user_usdc = legitimate_destination;
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+
+    assert_eq!(fixture.token(other_destination).amount, 0);
+}
+
+impl Fixture {
+    fn strategy_address(&self) -> Pubkey {
+        Pubkey::find_program_address(
+            &[
+                xau_carry_vault::constants::STRATEGY_SEED,
+                self.vault_state.as_ref(),
+            ],
+            &self.program_id,
+        )
+        .0
+    }
+
+    fn read_idle_nav_at(
+        &mut self,
+        strategy_account: Pubkey,
+    ) -> Result<xau_carry_vault::IdleNavQuoteV1, String> {
+        use anchor_lang::AnchorDeserialize;
+
+        let instruction = anchor_lang::solana_program::instruction::Instruction {
+            program_id: self.program_id,
+            accounts: xau_carry_vault::accounts::ReadIdleNavV1 {
+                vault_v1_state: self.vault_state,
+                usdc_mint: self.usdc_mint,
+                vault_v1_usdc_account: self.vault_usdc,
+                vxau_mint: self.vxau_mint,
+                strategy_account,
+            }
+            .to_account_metas(None),
+            data: xau_carry_vault::instruction::ReadIdleNavV1 {}.data(),
+        };
+
+        // The instruction has no signer requirement.
+        // The user signs only as the transaction fee payer.
+        let message = Message::new_with_blockhash(
+            &[instruction],
+            Some(&self.user.pubkey()),
+            &self.svm.latest_blockhash(),
+        );
+
+        let transaction =
+            VersionedTransaction::try_new(VersionedMessage::Legacy(message), &[&self.user])
+                .unwrap();
+
+        let result = self.svm.send_transaction(transaction);
+        self.svm.expire_blockhash();
+
+        let metadata = result.map_err(|error| format!("{error:?}"))?;
+
+        if metadata.return_data.program_id != self.program_id {
+            return Err(format!(
+                "Unexpected return-data program: {}",
+                metadata.return_data.program_id,
+            ));
+        }
+
+        xau_carry_vault::IdleNavQuoteV1::try_from_slice(&metadata.return_data.data)
+            .map_err(|error| format!("Invalid NAV return data: {error}"))
+    }
+
+    fn read_idle_nav(&mut self) -> Result<xau_carry_vault::IdleNavQuoteV1, String> {
+        let strategy = self.strategy_address();
+        self.read_idle_nav_at(strategy)
+    }
+
+    fn inject_disabled_strategy(&mut self) {
+        let strategy = xau_carry_vault::StrategyV1State {
+            vault: self.vault_state,
+            gold_mint: Pubkey::new_unique(),
+            gold_custody: Pubkey::new_unique(),
+            gold_token_program: spl_token::ID,
+            perpetual_program: Pubkey::new_unique(),
+            perpetual_store: Pubkey::new_unique(),
+            perpetual_market: Pubkey::new_unique(),
+            configured_at_slot: 0,
+            execution_enabled: false,
+            bump: Pubkey::find_program_address(
+                &[
+                    xau_carry_vault::constants::STRATEGY_SEED,
+                    self.vault_state.as_ref(),
+                ],
+                &self.program_id,
+            )
+            .1,
+        };
+
+        let mut data = Vec::new();
+        strategy.try_serialize(&mut data).unwrap();
+
+        let address = self.strategy_address();
+
+        self.svm
+            .set_account(
+                address,
+                Account {
+                    lamports: self.svm.minimum_balance_for_rent_exemption(data.len()),
+                    data,
+                    owner: self.program_id,
+                    executable: false,
+                    rent_epoch: 0,
+                },
+            )
+            .unwrap();
+    }
+}
+
+#[test]
+fn idle_nav_reports_empty_vault() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    // Leave the canonical strategy PDA nonexistent.
+    // This also exercises reading an absent account.
+    assert!(fixture
+        .svm
+        .get_account(&fixture.strategy_address())
+        .is_none());
+
+    let quote = fixture.read_idle_nav().unwrap();
+
+    assert_eq!(quote.net_assets, 0);
+    assert_eq!(quote.share_supply, 0);
+}
+
+#[test]
+fn idle_nav_reads_current_balances_after_redemption() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let redeemed = DEPOSIT_AMOUNT / 2;
+    fixture.withdraw(redeemed).unwrap();
+
+    // Historical deposits remain unchanged after redemption.
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT);
+
+    let state_before = fixture.svm.get_account(&fixture.vault_state).unwrap();
+    let custody_before = fixture.svm.get_account(&fixture.vault_usdc).unwrap();
+    let mint_before = fixture.svm.get_account(&fixture.vxau_mint).unwrap();
+
+    let quote = fixture.read_idle_nav().unwrap();
+
+    assert_eq!(quote.net_assets, DEPOSIT_AMOUNT - redeemed);
+    assert_eq!(quote.share_supply, DEPOSIT_AMOUNT - redeemed);
+
+    // Quoting must not modify vault accounting or token accounts.
+    for (address, before) in [
+        (fixture.vault_state, state_before),
+        (fixture.vault_usdc, custody_before),
+        (fixture.vxau_mint, mint_before),
+    ] {
+        let after = fixture.svm.get_account(&address).unwrap();
+        assert_eq!(after.data, before.data);
+        assert_eq!(after.lamports, before.lamports);
+        assert_eq!(after.owner, before.owner);
+    }
+}
+
+#[test]
+fn idle_nav_includes_unsolicited_custody_tokens() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let donation = DEPOSIT_AMOUNT / 2;
+
+    // Move mock USDC from the user into custody without minting
+    // receipts. Total USDC supply remains unchanged.
+    let mut source_account = fixture.svm.get_account(&fixture.user_usdc).unwrap();
+    let mut source = SplTokenAccount::unpack(&source_account.data).unwrap();
+
+    source.amount = source.amount.checked_sub(donation).unwrap();
+    SplTokenAccount::pack(source, &mut source_account.data).unwrap();
+
+    let mut custody_account = fixture.svm.get_account(&fixture.vault_usdc).unwrap();
+    let mut custody = SplTokenAccount::unpack(&custody_account.data).unwrap();
+
+    custody.amount = custody.amount.checked_add(donation).unwrap();
+    SplTokenAccount::pack(custody, &mut custody_account.data).unwrap();
+
+    fixture
+        .svm
+        .set_account(fixture.user_usdc, source_account)
+        .unwrap();
+    fixture
+        .svm
+        .set_account(fixture.vault_usdc, custody_account)
+        .unwrap();
+
+    let quote = fixture.read_idle_nav().unwrap();
+
+    assert_eq!(quote.net_assets, DEPOSIT_AMOUNT + donation);
+    assert_eq!(quote.share_supply, DEPOSIT_AMOUNT);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn idle_nav_rejects_configured_strategy_even_when_disabled() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+    fixture.inject_disabled_strategy();
+
+    let error = fixture.read_idle_nav().unwrap_err();
+
+    assert!(
+        error.contains("FullStrategyNavRequired"),
+        "Expected full strategy NAV requirement; received: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn idle_nav_rejects_substituted_strategy_address() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+
+    // An empty system-owned account satisfies the handler's
+    // absence check, but must fail the canonical PDA constraint.
+    let substituted = Pubkey::new_unique();
+
+    fixture
+        .svm
+        .set_account(
+            substituted,
+            Account {
+                lamports: fixture.svm.minimum_balance_for_rent_exemption(0),
+                data: Vec::new(),
+                owner: system_program::ID,
+                executable: false,
+                rent_epoch: 0,
+            },
+        )
+        .unwrap();
+
+    let error = fixture.read_idle_nav_at(substituted).unwrap_err();
+
+    assert!(
+        error.contains("ConstraintSeeds"),
+        "Expected strategy PDA rejection; received: {error}",
+    );
+}
+
+impl Fixture {
+    fn deposit(&mut self, amount: u64) -> Result<(), String> {
+        self.deposit_with_min(amount, 1)
+    }
+
+    fn withdraw(&mut self, amount: u64) -> Result<(), String> {
+        self.withdraw_with_min(amount, 1)
+    }
+
+    // Local test-only balance injection.
+    fn set_custody_amount(&mut self, amount: u64) {
+        let mut account = self.svm.get_account(&self.vault_usdc).unwrap();
+        let mut custody = SplTokenAccount::unpack(&account.data).unwrap();
+
+        custody.amount = amount;
+        SplTokenAccount::pack(custody, &mut account.data).unwrap();
+
+        self.svm.set_account(self.vault_usdc, account).unwrap();
+    }
+}
+
+#[test]
+fn deposit_prices_shares_against_increased_nav() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    // Existing shares now represent twice their initial assets.
+    fixture.set_custody_amount(DEPOSIT_AMOUNT * 2);
+
+    let expected_shares = DEPOSIT_AMOUNT / 2;
+    fixture
+        .deposit_with_min(DEPOSIT_AMOUNT, expected_shares)
+        .unwrap();
+
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, DEPOSIT_AMOUNT * 3,);
+    assert_eq!(
+        fixture.mint(fixture.vxau_mint).supply,
+        DEPOSIT_AMOUNT + expected_shares,
+    );
+    assert_eq!(
+        fixture.token(fixture.user_vxau).amount,
+        DEPOSIT_AMOUNT + expected_shares,
+    );
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT * 2,);
+}
+
+#[test]
+fn deposit_prices_shares_against_reduced_nav() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    fixture.set_custody_amount(DEPOSIT_AMOUNT / 2);
+
+    fixture
+        .deposit_with_min(DEPOSIT_AMOUNT, DEPOSIT_AMOUNT * 2)
+        .unwrap();
+
+    assert_eq!(
+        fixture.token(fixture.vault_usdc).amount,
+        DEPOSIT_AMOUNT + DEPOSIT_AMOUNT / 2,
+    );
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT * 3,);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, DEPOSIT_AMOUNT * 3,);
+}
+
+#[test]
+fn deposit_rejects_output_below_minimum_without_changes() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let error = fixture
+        .deposit_with_min(DEPOSIT_AMOUNT, DEPOSIT_AMOUNT + 1)
+        .unwrap_err();
+
+    assert!(
+        error.contains("MinimumOutputNotMet"),
+        "Unexpected error: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn withdraw_returns_increased_share_value() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    fixture.set_custody_amount(DEPOSIT_AMOUNT * 2);
+
+    let shares = DEPOSIT_AMOUNT / 2;
+    fixture.withdraw_with_min(shares, DEPOSIT_AMOUNT).unwrap();
+
+    assert_eq!(fixture.token(fixture.user_usdc).amount, INITIAL_USDC);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, shares);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, shares);
+}
+
+#[test]
+fn withdraw_rejects_output_below_minimum_without_burning() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let error = fixture
+        .withdraw_with_min(DEPOSIT_AMOUNT, DEPOSIT_AMOUNT + 1)
+        .unwrap_err();
+
+    assert!(
+        error.contains("MinimumOutputNotMet"),
+        "Unexpected error: {error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn pricing_rejects_configured_strategy_for_both_handlers() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+    fixture.inject_disabled_strategy();
+
+    let deposit_error = fixture.deposit(1).unwrap_err();
+    let withdrawal_error = fixture.withdraw(1).unwrap_err();
+
+    assert!(
+        deposit_error.contains("FullStrategyNavRequired"),
+        "Unexpected deposit error: {deposit_error}",
+    );
+    assert!(
+        withdrawal_error.contains("FullStrategyNavRequired"),
+        "Unexpected withdrawal error: {withdrawal_error}",
+    );
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn deposit_rejects_zero_nav_with_outstanding_shares() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    fixture.set_custody_amount(0);
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("VaultInsolvent"),
+        "Unexpected error: {error}",
+    );
+
+    assert_eq!(
+        fixture.token(fixture.user_usdc).amount,
+        INITIAL_USDC - DEPOSIT_AMOUNT,
+    );
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 0);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.state().total_deposited, DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn pricing_requires_positive_minimum_outputs() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    let deposit_error = fixture.deposit_with_min(DEPOSIT_AMOUNT, 0).unwrap_err();
+    let withdrawal_error = fixture.withdraw_with_min(DEPOSIT_AMOUNT, 0).unwrap_err();
+
+    assert!(deposit_error.contains("InvalidMinimumOutput"));
+    assert!(withdrawal_error.contains("InvalidMinimumOutput"));
+
+    fixture.assert_deposit_intact(DEPOSIT_AMOUNT);
+}
+
+#[test]
+fn withdraw_rejects_output_rounded_to_zero() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.deposit(DEPOSIT_AMOUNT).unwrap();
+
+    fixture.set_custody_amount(1);
+
+    let error = fixture.withdraw(1).unwrap_err();
+
+    assert!(
+        error.contains("RedemptionTooSmall"),
+        "Unexpected error: {error}",
+    );
+
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 1);
+    assert_eq!(fixture.token(fixture.user_vxau).amount, DEPOSIT_AMOUNT,);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, DEPOSIT_AMOUNT,);
+}
+
+#[test]
+fn deposit_rejects_assets_without_outstanding_shares() {
+    let mut fixture = Fixture::new(6);
+    fixture.initialize_as_admin();
+    fixture.set_custody_amount(1);
+
+    let error = fixture.deposit(DEPOSIT_AMOUNT).unwrap_err();
+
+    assert!(
+        error.contains("InvalidShareBootstrap"),
+        "Unexpected error: {error}",
+    );
+
+    assert_eq!(fixture.token(fixture.user_usdc).amount, INITIAL_USDC);
+    assert_eq!(fixture.token(fixture.vault_usdc).amount, 1);
+    assert_eq!(fixture.mint(fixture.vxau_mint).supply, 0);
+    assert_eq!(fixture.state().total_deposited, 0);
+
+    // Receipt ATA creation must also roll back.
+    assert!(fixture
+        .svm
+        .get_account(&fixture.user_vxau)
+        .map_or(true, |account| account.lamports == 0));
+}

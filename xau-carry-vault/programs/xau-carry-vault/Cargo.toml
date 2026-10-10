@@ -23,6 +23,10 @@ custom-panic = []
 anchor-lang = { version = "=1.2.0", features = ["init-if-needed"] }
 anchor-spl = "1.2.0"
 
+gmsol-programs = { path = "../../vendor/gmtrade/programs", features = ["model"] }
+gmsol-model = { path = "../../vendor/gmtrade/model", features = ["u128"] }
+bytemuck = { version = "1", features = ["extern_crate_alloc", "min_const_generics"] }
+
 [dev-dependencies]
 litesvm = "0.10.0"
 solana-message = "3.0.1"
@@ -32,6 +36,9 @@ solana-keypair = "3.0.1"
 solana-account = "3.0"
 solana-program-pack = "3.0"
 solana-program-option = "3.0"
+base64 = "0.22"
+serde_json = "1.0"
+solana-last-restart-slot = "3.0"
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(target_os, values("solana"))'] }

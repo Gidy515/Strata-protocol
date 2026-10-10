@@ -1,0 +1,35 @@
+{
+  "receiver": "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp",
+  "feeds": {
+    "paxg": {
+      "symbol": "Crypto.PAXG/USD",
+      "feed_id": "273717b49430906f4b0c230e99aa1007f83758e3199edbc887c0d06c3e332494",
+      "observed_slot": 454542287,
+      "matching_account_count": 1,
+      "observation": {
+        "address": "AwBRZ5QYW8RhcF4EJaU1WSn42cPQFZU3yvSDg1uSh748",
+        "price": 414218464311,
+        "confidence": 87735928,
+        "exponent": -8,
+        "published_at": 1791350951,
+        "posted_slot": 454129125,
+        "age_seconds_at_capture": 110878
+      }
+    },
+    "usdc": {
+      "symbol": "Crypto.USDC/USD",
+      "feed_id": "eaa020c61cc479712813461ce153894a96a6c00b21ed0cfc2798d1f9a9e9c94a",
+      "observed_slot": 454542293,
+      "matching_account_count": 1,
+      "observation": {
+        "address": "6HAuqASbHEh4w4REJEUUUCginTLfj1kwCh215ZLtMkrT",
+        "price": 99982059,
+        "confidence": 64497,
+        "exponent": -8,
+        "published_at": 1791461827,
+        "posted_slot": 454542283,
+        "age_seconds_at_capture": 4
+      }
+    }
+  }
+}

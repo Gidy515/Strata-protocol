@@ -1,11 +1,7 @@
 use anchor_lang::prelude::*;
 use anchor_spl::token::{Mint, Token, TokenAccount};
 
-use crate::{
-    constants::*,
-    error::VaultError,
-    state::VaultV1State,
-};
+use crate::{constants::*, error::VaultError, state::VaultV1State};
 
 #[derive(Accounts)]
 pub struct InitializeVaultV1<'info> {
@@ -75,15 +71,20 @@ pub struct InitializeVaultV1<'info> {
     pub rent: Sysvar<'info, Rent>,
 }
 
-pub fn handle_initialize(
-    ctx: Context<InitializeVaultV1>,
-) -> Result<()> {
+pub fn handle_initialize(ctx: Context<InitializeVaultV1>) -> Result<()> {
     ctx.accounts.vault_v1_state.set_inner(VaultV1State {
         admin: ctx.accounts.admin.key(),
         usdc_mint: ctx.accounts.usdc_mint.key(),
         vxau_mint: ctx.accounts.vxau_mint.key(),
         total_deposited: 0,
         bump: ctx.bumps.vault_v1_state,
+
+        pending_admin: Pubkey::default(),
+        deposits_paused: false,
+        withdrawals_paused: false,
+        strategy_paused: false,
+        max_order_collateral: u64::MAX,
+        max_order_size: u128::MAX,
     });
 
     Ok(())

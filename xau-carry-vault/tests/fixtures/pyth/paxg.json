@@ -1,0 +1,19 @@
+{
+  "context": {
+    "slot": 454542287,
+    "apiVersion": "4.3.0-beta.2"
+  },
+  "pubkey": "AwBRZ5QYW8RhcF4EJaU1WSn42cPQFZU3yvSDg1uSh748",
+  "account": {
+    "lamports": 1823520,
+    "data": [
+      "IvEjY51+9M2TmlTruvTLMZJmdDgOSP2KsPWqeSq2MC4sP3OS7jJUXQEnNxe0lDCQb0sMIw6ZqhAH+DdY4xme28iHwNBsPjMklDcsWHFgAAAAeL46BQAAAAD4////p9jFagAAAACm2MVqAAAAAHhXdYJgAAAA9cNTBQAAAADldREbAAAAAAA=",
+      "base64"
+    ],
+    "owner": "rec2HHDDnjLfj4kE7VyEtFA1HPGQLK33259532cRyHp",
+    "executable": false,
+    "rentEpoch": 18446744073709551615,
+    "space": 134
+  },
+  "feed_id": "273717b49430906f4b0c230e99aa1007f83758e3199edbc887c0d06c3e332494"
+}

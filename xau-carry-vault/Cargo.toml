@@ -1,4 +1,5 @@
 [workspace]
+exclude = ["vendor/gmtrade"]
 members = [
     "programs/*"
 ]
