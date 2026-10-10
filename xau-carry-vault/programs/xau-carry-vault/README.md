@@ -172,6 +172,24 @@ Coverage includes initialization, deposits, redemptions, withdrawal queues, NAV 
 
 Tests use controlled price updates, a test-only swap router, captured GMTrade fixtures, and controlled execution-state transitions. The router fixture is exclusively for testing.
 
+### Test results
+
+The Vault 1 test suite passed all 119 tests: 54 unit tests,
+64 integration tests, and one explicitly enabled GMTrade snapshot test.
+
+![Vault 1 test results](docs/images/vault1-test-results.png)
+
+### Live integration blocker
+
+The gold-feed access options evaluated required paid access that had
+not yet been arranged. Contract validation therefore used controlled
+authenticated price updates and captured GMTrade fixtures.
+
+Live oracle delivery, production Jupiter routing, actual GMTrade
+execution, and keeper transaction sequencing still require end-to-end
+verification. These local test results do not establish live deployment
+readiness.
+
 ## Integration with Vault 2
 
 Vault 2 must derive the vXAU mint from the configured Vault 1 state and enforce that mint identity in its account constraints.
