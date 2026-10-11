@@ -36,15 +36,17 @@ import {
   Transaction,
 } from "@solana/web3.js";
 import { expect } from "chai";
+import { createHash } from "crypto";
 import { readFileSync } from "fs";
 import * as path from "path";
 import idl from "../../../../../target/idl/basket_weighted_vault.json";
-import xauIdl from "../../../../../target/idl/xau_carry_vault.json";
 import { BasketWeightedVault } from "../../../../../target/types/basket_weighted_vault";
 import { LiteSVMProvider, LiteSVMTransactionError } from "./litesvm-provider";
 
 export const PROGRAM_ID = new PublicKey(idl.address);
-export const XAU_PROGRAM_ID = new PublicKey(xauIdl.address);
+export const XAU_PROGRAM_ID = new PublicKey(
+  "G1FuDAbgPsVw95XnEjT68nqpswUtvxFBtxz4mdTJKsye"
+);
 export const PYTH_RECEIVER_ID = new PublicKey(
   "rec5EKMGg6MxZYaMdyBfgwp4d5rB9T1VQH5pJv5LtFJ"
 );
@@ -499,12 +501,29 @@ export class TestBasket {
     vxauMint: PublicKey,
     owner: PublicKey
   ): Promise<void> {
-    const coder = new BorshAccountsCoder(xauIdl as Idl);
+    const vaultV1Type = idl.types.find((t) => t.name === "VaultV1State")!;
+    const discriminator = createHash("sha256")
+      .update("account:VaultV1State")
+      .digest()
+      .subarray(0, 8);
+    const coder = new BorshAccountsCoder({
+      ...idl,
+      accounts: [{ name: "VaultV1State", discriminator: [...discriminator] }],
+    } as Idl);
+    const fields: Record<string, unknown> = {};
+    for (const field of vaultV1Type.type.fields!) {
+      fields[field.name] =
+        field.type === "pubkey"
+          ? PublicKey.default
+          : field.type === "bool"
+          ? false
+          : new BN(0);
+    }
     const data = await coder.encode("VaultV1State", {
+      ...fields,
       admin: Keypair.generate().publicKey,
       usdc_mint: Keypair.generate().publicKey,
       vxau_mint: vxauMint,
-      total_deposited: new BN(0),
       bump: 255,
     });
     this.provider.setAccount(key, owner, data);

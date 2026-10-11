@@ -6,11 +6,7 @@ resolution = true
 skip-lint = false
 
 [programs.localnet]
-basket-weighted-vault = "DN3quR3M9kWnw1v9bmY93vdWu3ciRPgb72HPKpQoTDC2"
 xau_carry_vault = "G1FuDAbgPsVw95XnEjT68nqpswUtvxFBtxz4mdTJKsye"
-
-[programs.devnet]
-basket-weighted-vault = "DN3quR3M9kWnw1v9bmY93vdWu3ciRPgb72HPKpQoTDC2"
 
 [provider]
 cluster = "localnet"
