@@ -49,6 +49,13 @@ strata-protocol/
 
 Vault 2 depends on the Vault 1 crate (`../../../xau-carry-vault/programs/xau-carry-vault`, `cpi` feature) for Vault 1's program ID, vXAU seed and `VaultV1State` type.
 
+## Team ownership
+
+- Gideon: Vault 1 initialization, USDC deposits, and vXAU receipt issuance.
+- Ankit: Vault 2 initialization, basket deposits, and permissionless rebalancing.
+- Viraz: Rebalancing 
+- Shared review: the vXAU mint, decimals, token program, POC valuation, and cross-program integration tests.
+
 ## Devnet deployment
 
 Both programs are deployed to Solana devnet.
