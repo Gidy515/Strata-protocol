@@ -309,6 +309,14 @@ Tests use controlled price updates, a test-only swap router, captured GMTrade fi
 The Vault 1 test suite passed all 119 tests: 54 unit tests,
 64 integration tests, and one explicitly enabled GMTrade snapshot test.
 
+![Vault 1 test results — screenshot 1](docs/images/Pasted%20image1.png)
+
+![Vault 1 test results — screenshot 2](docs/images/Pasted%20image2.png)
+
+![Vault 1 test results — screenshot 3](docs/images/Pasted%20image3.png)
+
+![Vault 1 test results — screenshot 4](docs/images/Pasted%20image4.png)
+
 ![Vault 1 test results](xau-carry-vault/programs/xau-carry-vault/docs/images/vault1-test-results.png)
 
 ### Live integration blocker
